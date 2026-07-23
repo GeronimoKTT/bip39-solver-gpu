@@ -1,0 +1,16 @@
+# Sample Shuffled Word List for bip39-solver-gpu
+# Target Address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy
+#
+# Words in shuffled order (replace unknown words with '?'):
+smile
+match
+accuse
+guide
+craft
+asset
+boat
+crush
+?
+?
+?
+?

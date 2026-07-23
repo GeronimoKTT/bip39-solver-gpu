@@ -1,0 +1,16 @@
+# Sample Test Vector for bip39-solver-gpu
+# Target Address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy
+#
+# Known words (in correct prefix order with 4 trailing unknown words '?'):
+guide
+accuse
+match
+boat
+crush
+craft
+smile
+asset
+?
+?
+?
+?
