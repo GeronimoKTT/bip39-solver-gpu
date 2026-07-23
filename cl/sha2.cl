@@ -294,6 +294,8 @@ static void sha512(unsigned long *input, const unsigned int length, ulong *hash)
 static void sha256(const void *input_ptr, int pass_len, void *output_ptr) {
   const unsigned int *pass = (const unsigned int *)input_ptr;
   unsigned int *p = (unsigned int *)output_ptr;
+  int plen = pass_len / 4;
+  if (mod(pass_len, 4)) plen++;
   unsigned int W[0x10]={0};
   int loops=plen;
   int curloop=0;

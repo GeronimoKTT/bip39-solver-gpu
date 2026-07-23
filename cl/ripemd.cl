@@ -232,8 +232,9 @@ void ripemd160_Update( RIPEMD160_CTX *ctx, const uint8_t *input, uint32_t ilen )
     }
 }
 
-void ripemd160_Final( RIPEMD160_CTX *ctx, uint8_t output[20] )
+void ripemd160_Final( RIPEMD160_CTX *ctx, void *output_ptr )
 {
+    uint8_t *output = (uint8_t *)output_ptr;
     uint32_t last, padn;
     uint32_t high, low;
     uint8_t msglen[8];
