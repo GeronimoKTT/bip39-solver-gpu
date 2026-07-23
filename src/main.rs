@@ -18,15 +18,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Parser, Debug)]
 #[command(
     author = "BIP39 Solver GPU",
-    version = "0.3.0",
+    version = "0.4.0",
     about = "GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
-    /// Target Bitcoin Base58 address or path to a .tsv / .txt file containing address and balance columns
-    #[arg(short, long)]
+    /// Target Bitcoin Base58 address, path to a .tsv/.txt file, or 'auto'
+    #[arg(short, long, default_value = "auto")]
     address: String,
 
-    /// Path to text file containing 12 words (separated by spaces or newlines). Use '?' for missing words.
+    /// Path to text file containing 12 words, or 'auto' to auto-generate a random 12-word seed
     #[arg(short, long)]
     file: String,
 
@@ -110,50 +110,137 @@ fn load_targets(address_input: &str) -> Vec<TargetEntry> {
     }
 }
 
-fn main() {
-    let args = Args::parse();
-
-    // 1. Load Target Addresses (single address or .tsv file)
-    let targets = load_targets(&args.address);
-
-    let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
-    for t in &targets {
-        flat_target_bytes.extend_from_slice(&t.address_bytes);
+fn get_random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut bytes);
+        u64::from_le_bytes(bytes)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        (nanos ^ 0x9E3779B97F4A7C15) as u64
     }
-    let num_targets = targets.len() as u32;
+}
 
-    // 2. Load and Parse 12-Word List File
-    let file_content = fs::read_to_string(&args.file).unwrap_or_else(|e| {
-        eprintln!("Error reading file '{}': {}", args.file, e);
-        std::process::exit(1);
-    });
-
-    let raw_words: Vec<&str> = file_content
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .flat_map(|line| line.split_whitespace())
-        .collect();
-
-    if raw_words.is_empty() {
-        eprintln!("Error: Wordlist file '{}' is empty", args.file);
-        std::process::exit(1);
+fn shuffle_words(words: &mut [String]) {
+    let n = words.len();
+    for i in (1..n).rev() {
+        let rand_val = get_random_u64();
+        let j = (rand_val as usize) % (i + 1);
+        words.swap(i, j);
     }
+}
 
-    let mut words = Vec::new();
-    for i in 0..12 {
-        if i < raw_words.len() {
-            words.push(raw_words[i]);
-        } else {
-            words.push("?");
+fn generate_auto_bip39_seed() -> (Vec<String>, u64, u64) {
+    let mut entropy = [0u8; 16];
+    if let Ok(mut f) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut entropy);
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut seed = nanos;
+        for i in 0..16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            entropy[i] = (seed >> 24) as u8;
         }
     }
 
-    println!("Input Words (12): {:?}", words);
+    let sha_res = simple_sha256(&entropy);
+    let checksum = (sha_res[0] >> 4) & 0x0F;
 
-    let has_wildcards = words.iter().any(|&w| w == "?" || w == "*" || w == "x");
+    let entropy_u128 = u128::from_be_bytes(entropy);
 
-    // 3. Load OpenCL Program Source
+    let mut word_indices = [0u16; 12];
+    word_indices[0] = ((entropy_u128 >> 117) & 2047) as u16;
+    word_indices[1] = ((entropy_u128 >> 106) & 2047) as u16;
+    word_indices[2] = ((entropy_u128 >> 95) & 2047) as u16;
+    word_indices[3] = ((entropy_u128 >> 84) & 2047) as u16;
+    word_indices[4] = ((entropy_u128 >> 73) & 2047) as u16;
+    word_indices[5] = ((entropy_u128 >> 62) & 2047) as u16;
+    word_indices[6] = ((entropy_u128 >> 51) & 2047) as u16;
+    word_indices[7] = ((entropy_u128 >> 40) & 2047) as u16;
+    word_indices[8] = ((entropy_u128 >> 29) & 2047) as u16;
+    word_indices[9] = ((entropy_u128 >> 18) & 2047) as u16;
+    word_indices[10] = ((entropy_u128 >> 7) & 2047) as u16;
+    word_indices[11] = ((((entropy_u128 & 0x7F) as u16) << 4) | (checksum as u16)) as u16;
+
+    let words: Vec<String> = word_indices
+        .iter()
+        .map(|&idx| bip39::BIP39_WORDS[idx as usize].to_string())
+        .collect();
+
+    let hi = (entropy_u128 >> 64) as u64;
+    let lo = (entropy_u128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+
+    (words, hi, lo)
+}
+
+fn derive_gpu_address(
+    platform_id: core::types::abs::PlatformId,
+    device_id: core::types::abs::DeviceId,
+    src: CString,
+    hi: u64,
+    lo: u64,
+) -> String {
+    let context_properties = ContextProperties::new().platform(platform_id);
+    let context = core::create_context(Some(&context_properties), &[device_id], None, None).unwrap();
+    let program = core::create_program_with_source(&context, &[src]).unwrap();
+    core::build_program(&program, Some(&[device_id]), &CString::new("").unwrap(), None, None).unwrap();
+    let queue = core::create_command_queue(&context, &device_id, None).unwrap();
+
+    let mut raw_address = vec![0u8; 25];
+    let address_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+            25,
+            Some(&raw_address),
+        ).unwrap()
+    };
+
+    let kernel = core::create_kernel(&program, "get_address_for_entropy").unwrap();
+    core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&hi)).unwrap();
+    core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&lo)).unwrap();
+    core::set_kernel_arg(&kernel, 2, ArgVal::mem(&address_buf)).unwrap();
+
+    unsafe {
+        core::enqueue_kernel(
+            &queue,
+            &kernel,
+            1,
+            None,
+            &[1, 1, 1],
+            None,
+            None::<core::Event>,
+            None::<&mut core::Event>,
+        ).unwrap();
+    }
+
+    unsafe {
+        core::enqueue_read_buffer(
+            &queue,
+            &address_buf,
+            true,
+            0,
+            &mut raw_address,
+            None::<core::Event>,
+            None::<&mut core::Event>,
+        ).unwrap();
+    }
+
+    bs58::encode(&raw_address).into_string()
+}
+
+fn main() {
+    let mut args = Args::parse();
+
+    // 1. Load OpenCL Program Source
     let cl_files = [
         "common",
         "ripemd",
@@ -222,6 +309,68 @@ fn main() {
         println!("  [GPU {}] Device Name: {}", idx, name);
     }
 
+    let is_auto_file = args.file.to_lowercase() == "auto";
+    let mut words: Vec<String> = Vec::new();
+
+    if is_auto_file {
+        let (ordered_words, hi, lo) = generate_auto_bip39_seed();
+        let derived_addr = derive_gpu_address(platform_id, device_ids[0], src_cstring.clone(), hi, lo);
+
+        if args.address.to_lowercase() == "auto" {
+            args.address = derived_addr.clone();
+        }
+
+        let mut shuffled = ordered_words.clone();
+        shuffle_words(&mut shuffled);
+        words = shuffled;
+
+        println!("\n================================================--------------------------------");
+        println!("🎲 AUTO-GENERATED RANDOM VALID BIP39 BITCOIN SEED:");
+        println!("  Original Ordered Seed (Secret): {}", ordered_words.join(" "));
+        println!("  Derived Target Bitcoin Address: {}", derived_addr);
+        println!("  Shuffled 12-Word Input (--file): {}", words.join(" "));
+        println!("================================================--------------------------------\n");
+    } else {
+        let file_content = fs::read_to_string(&args.file).unwrap_or_else(|e| {
+            eprintln!("Error reading file '{}': {}", args.file, e);
+            std::process::exit(1);
+        });
+
+        let raw_words: Vec<String> = file_content
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .flat_map(|line| line.split_whitespace())
+            .map(|s| s.to_string())
+            .collect();
+
+        if raw_words.is_empty() {
+            eprintln!("Error: Wordlist file '{}' is empty", args.file);
+            std::process::exit(1);
+        }
+
+        for i in 0..12 {
+            if i < raw_words.len() {
+                words.push(raw_words[i].clone());
+            } else {
+                words.push("?".to_string());
+            }
+        }
+    }
+
+    let word_refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    println!("Input Words (12): {:?}", word_refs);
+
+    // 2. Load Target Addresses
+    let targets = load_targets(&args.address);
+
+    let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
+    for t in &targets {
+        flat_target_bytes.extend_from_slice(&t.address_bytes);
+    }
+    let num_targets = targets.len() as u32;
+
+    let has_wildcards = word_refs.iter().any(|&w| w == "?" || w == "*" || w == "x");
     let flat_bytes = flat_target_bytes.clone();
 
     if !has_wildcards {
@@ -229,7 +378,7 @@ fn main() {
         println!("\n=== Running Mode: PERMUTATION MODE ===");
         println!("Generating and filtering permutations in parallel across CPU cores...");
 
-        let candidate_pairs = generate_permutation_candidates_parallel(&words);
+        let candidate_pairs = generate_permutation_candidates_parallel(&word_refs);
         println!("Found {} valid BIP39 checksum candidates. Pre-loading target address buffer into GPU memory...", candidate_pairs.len());
 
         let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
@@ -258,7 +407,7 @@ fn main() {
         let mut start_entropy: u128 = 0;
         let mut missing_entropy_bits: u32 = 0;
 
-        for (i, &word) in words.iter().enumerate() {
+        for (i, &word) in word_refs.iter().enumerate() {
             if let Some(idx) = bip39::get_word_index(word) {
                 let idx = idx as u128;
                 let shift = match i {
