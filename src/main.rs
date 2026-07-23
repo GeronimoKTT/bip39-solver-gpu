@@ -61,7 +61,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    let raw_words: Vec<&str> = file_content.split_whitespace().collect();
+    let raw_words: Vec<&str> = file_content
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(|line| line.split_whitespace())
+        .collect();
+
     if raw_words.is_empty() {
         eprintln!("Error: Wordlist file '{}' is empty", args.file);
         std::process::exit(1);
@@ -78,51 +84,9 @@ fn main() {
 
     println!("Input Words (12): {:?}", words);
 
-    // 3. Compute Base Entropy and Missing Bit Count
-    let mut start_entropy: u128 = 0;
-    let mut missing_entropy_bits: u32 = 0;
+    let has_wildcards = words.iter().any(|&w| w == "?" || w == "*" || w == "x");
 
-    for (i, &word) in words.iter().enumerate() {
-        if let Some(idx) = bip39::get_word_index(word) {
-            let idx = idx as u128;
-            let shift = match i {
-                0 => 117,
-                1 => 106,
-                2 => 95,
-                3 => 84,
-                4 => 73,
-                5 => 62,
-                6 => 51,
-                7 => 40,
-                8 => 29,
-                9 => 18,
-                10 => 7,
-                11 => 0,
-                _ => unreachable!(),
-            };
-            if i == 11 {
-                start_entropy |= (idx >> 4) << shift;
-            } else {
-                start_entropy |= idx << shift;
-            }
-        } else {
-            let bits = if i == 11 { 7 } else { 11 };
-            missing_entropy_bits += bits;
-        }
-    }
-
-    let total_space: u64 = if missing_entropy_bits >= 64 {
-        u64::MAX
-    } else {
-        1u64 << missing_entropy_bits
-    };
-
-    println!("Missing entropy bits: {}", missing_entropy_bits);
-    println!("Total search space: {} combinations", total_space);
-    println!("Batch size: {}", args.batch_size);
-
-    // 4. Load OpenCL Kernels
-    let kernel_name = "int_to_address".to_string();
+    // 3. Load OpenCL Program Source
     let cl_files = [
         "common",
         "ripemd",
@@ -153,7 +117,6 @@ fn main() {
 
     let src_cstring = CString::new(raw_cl_file).unwrap();
 
-    // 5. Initialize OpenCL Devices
     let platform_id = match core::default_platform() {
         Ok(p) => p,
         Err(e) => {
@@ -173,28 +136,377 @@ fn main() {
         },
     };
 
-    println!("Found {} OpenCL device(s). Starting solver...", device_ids.len());
+    println!("Found {} OpenCL device(s).", device_ids.len());
 
-    let batch_size = args.batch_size;
+    if !has_wildcards {
+        // MODE 1: PERMUTATION MODE (12 known words, unordered)
+        println!("\n=== Running Mode: PERMUTATION MODE ===");
+        println!("Generating permutations of all 12 words and filtering valid BIP39 checksums...");
 
-    // 6. Run GPU Solver across available devices
-    device_ids.into_par_iter().for_each(move |device_id| {
-        if let Err(e) = mnemonic_gpu(
-            platform_id,
-            device_id,
-            src_cstring.clone(),
-            &kernel_name,
-            target_addr_bytes,
-            start_entropy,
-            total_space,
-            batch_size,
-        ) {
-            eprintln!("GPU execution error: {}", e);
+        let candidate_pairs = generate_permutation_candidates(&words);
+        println!("Found {} valid BIP39 candidate permutations to check on GPU.", candidate_pairs.len());
+
+        let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
+        let batch_size = args.batch_size;
+        let kernel_name = "int_to_address_perm";
+
+        device_ids.into_par_iter().for_each(move |device_id| {
+            if let Err(e) = mnemonic_gpu_perm(
+                platform_id,
+                device_id,
+                src_cstring.clone(),
+                kernel_name,
+                target_addr_bytes,
+                &hi_list,
+                &lo_list,
+                batch_size,
+            ) {
+                eprintln!("GPU Execution Error: {}", e);
+            }
+        });
+    } else {
+        // MODE 2: WILDCARD RANGE MODE (Some words unknown '?')
+        println!("\n=== Running Mode: WILDCARD RANGE MODE ===");
+
+        let mut start_entropy: u128 = 0;
+        let mut missing_entropy_bits: u32 = 0;
+
+        for (i, &word) in words.iter().enumerate() {
+            if let Some(idx) = bip39::get_word_index(word) {
+                let idx = idx as u128;
+                let shift = match i {
+                    0 => 117,
+                    1 => 106,
+                    2 => 95,
+                    3 => 84,
+                    4 => 73,
+                    5 => 62,
+                    6 => 51,
+                    7 => 40,
+                    8 => 29,
+                    9 => 18,
+                    10 => 7,
+                    11 => 0,
+                    _ => unreachable!(),
+                };
+                if i == 11 {
+                    start_entropy |= (idx >> 4) << shift;
+                } else {
+                    start_entropy |= idx << shift;
+                }
+            } else {
+                let bits = if i == 11 { 7 } else { 11 };
+                missing_entropy_bits += bits;
+            }
         }
-    });
+
+        let total_space: u64 = if missing_entropy_bits >= 64 {
+            u64::MAX
+        } else {
+            1u64 << missing_entropy_bits
+        };
+
+        println!("Missing entropy bits: {}", missing_entropy_bits);
+        println!("Total search space: {} combinations", total_space);
+        println!("Batch size: {}", args.batch_size);
+
+        let kernel_name = "int_to_address";
+        let batch_size = args.batch_size;
+
+        device_ids.into_par_iter().for_each(move |device_id| {
+            if let Err(e) = mnemonic_gpu_range(
+                platform_id,
+                device_id,
+                src_cstring.clone(),
+                kernel_name,
+                target_addr_bytes,
+                start_entropy,
+                total_space,
+                batch_size,
+            ) {
+                eprintln!("GPU Execution Error: {}", e);
+            }
+        });
+    }
 }
 
-fn mnemonic_gpu(
+/// Simple Sha256 helper for host-side checksum validation
+fn simple_sha256(data: &[u8]) -> [u8; 32] {
+    // Sha256 implementation for 16-byte buffer
+    use std::num::Wrapping;
+
+    let k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let mut h = [
+        Wrapping(0x6a09e667u32),
+        Wrapping(0xbb67ae85u32),
+        Wrapping(0x3c6ef372u32),
+        Wrapping(0xa54ff53au32),
+        Wrapping(0x510e527fu32),
+        Wrapping(0x9b05688cu32),
+        Wrapping(0x1f83d9abu32),
+        Wrapping(0x5be0cd19u32),
+    ];
+
+    let mut block = [0u8; 64];
+    block[..data.len()].copy_from_slice(data);
+    block[data.len()] = 0x80;
+    let bit_len = (data.len() as u64) * 8;
+    block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+
+    let mut w = [Wrapping(0u32); 64];
+    for i in 0..16 {
+        w[i] = Wrapping(u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]));
+    }
+    for i in 16..64 {
+        let s0 = (w[i - 15] >> 7 | w[i - 15] << 25) ^ (w[i - 15] >> 18 | w[i - 15] << 14) ^ (w[i - 15] >> 3);
+        let s1 = (w[i - 2] >> 17 | w[i - 2] << 15) ^ (w[i - 2] >> 19 | w[i - 2] << 13) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut h_var = h[7];
+
+    for i in 0..64 {
+        let s1_val = (e >> 6 | e << 26) ^ (e >> 11 | e << 21) ^ (e >> 25 | e << 7);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h_var + s1_val + ch + Wrapping(k[i]) + w[i];
+        let s0_val = (a >> 2 | a << 30) ^ (a >> 13 | a << 19) ^ (a >> 22 | a << 10);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0_val + maj;
+
+        h_var = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += h_var;
+
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].0.to_be_bytes());
+    }
+    out
+}
+
+fn generate_permutation_candidates(words: &[&str]) -> Vec<(u64, u64)> {
+    let mut indices: Vec<u16> = words
+        .iter()
+        .map(|w| bip39::get_word_index(w).unwrap_or_else(|| {
+            eprintln!("Error: Unknown BIP39 word '{}'", w);
+            std::process::exit(1);
+        }) as u16)
+        .collect();
+
+    indices.sort_unstable(); // Lexicographical sort
+
+    let mut candidates = Vec::new();
+
+    loop {
+        // Construct 16-byte entropy buffer from indices
+        let mut entropy_128: u128 = 0;
+        for (i, &idx) in indices.iter().take(11).enumerate() {
+            let shift = 117 - i * 11;
+            entropy_128 |= (idx as u128) << shift;
+        }
+        entropy_128 |= (indices[11] >> 4) as u128;
+
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&entropy_128.to_be_bytes());
+
+        let sha_res = simple_sha256(&bytes);
+        let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+        let actual_checksum = (indices[11] & 0x0F) as u8;
+
+        if expected_checksum == actual_checksum {
+            let hi = (entropy_128 >> 64) as u64;
+            let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+            candidates.push((hi, lo));
+        }
+
+        if !next_permutation(&mut indices) {
+            break;
+        }
+    }
+
+    candidates
+}
+
+fn next_permutation<T: Ord>(arr: &mut [T]) -> bool {
+    if arr.len() <= 1 {
+        return false;
+    }
+    let mut i = arr.len() - 1;
+    while i > 0 && arr[i - 1] >= arr[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let mut j = arr.len() - 1;
+    while arr[j] <= arr[i - 1] {
+        j -= 1;
+    }
+    arr.swap(i - 1, j);
+    arr[i..].reverse();
+    true
+}
+
+fn mnemonic_gpu_perm(
+    platform_id: core::types::abs::PlatformId,
+    device_id: core::types::abs::DeviceId,
+    src: CString,
+    kernel_name: &str,
+    target_addr_bytes: [u8; 25],
+    hi_list: &[u64],
+    lo_list: &[u64],
+    batch_size: u64,
+) -> ocl::core::Result<()> {
+    let context_properties = ContextProperties::new().platform(platform_id);
+    let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
+    let program = core::create_program_with_source(&context, &[src])?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let target_address_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            25,
+            Some(&target_addr_bytes),
+        )?
+    };
+
+    let total_candidates = hi_list.len();
+    let mut offset = 0;
+
+    while offset < total_candidates {
+        let chunk_len = std::cmp::min(batch_size as usize, total_candidates - offset);
+        let hi_chunk = &hi_list[offset..offset + chunk_len];
+        let lo_chunk = &lo_list[offset..offset + chunk_len];
+
+        let hi_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+                chunk_len,
+                Some(hi_chunk),
+            )?
+        };
+
+        let lo_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+                chunk_len,
+                Some(lo_chunk),
+            )?
+        };
+
+        let mut target_mnemonic = vec![0u8; 120];
+        let mut mnemonic_found = vec![0u8; 1];
+
+        let target_mnemonic_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                120,
+                Some(&target_mnemonic),
+            )?
+        };
+
+        let mnemonic_found_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                1,
+                Some(&mnemonic_found),
+            )?
+        };
+
+        let kernel = core::create_kernel(&program, kernel_name)?;
+
+        core::set_kernel_arg(&kernel, 0, ArgVal::mem(&hi_buf))?;
+        core::set_kernel_arg(&kernel, 1, ArgVal::mem(&lo_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_address_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&mnemonic_found_buf))?;
+
+        unsafe {
+            core::enqueue_kernel(
+                &queue,
+                &kernel,
+                1,
+                None,
+                &[chunk_len, 1, 1],
+                None,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        unsafe {
+            core::enqueue_read_buffer(
+                &queue,
+                &target_mnemonic_buf,
+                true,
+                0,
+                &mut target_mnemonic,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        unsafe {
+            core::enqueue_read_buffer(
+                &queue,
+                &mnemonic_found_buf,
+                true,
+                0,
+                &mut mnemonic_found,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        if mnemonic_found[0] == 0x01 {
+            let s = String::from_utf8_lossy(&target_mnemonic).to_string();
+            let mnemonic = s.trim_matches(char::from(0));
+            println!("\n========================================");
+            println!("🎉 MNEMONIC PERMUTATION FOUND!");
+            println!("Mnemonic: {}", mnemonic);
+            println!("========================================\n");
+            std::process::exit(0);
+        }
+
+        offset += chunk_len;
+    }
+
+    Ok(())
+}
+
+fn mnemonic_gpu_range(
     platform_id: core::types::abs::PlatformId,
     device_id: core::types::abs::DeviceId,
     src: CString,

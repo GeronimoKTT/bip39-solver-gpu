@@ -1,16 +1,16 @@
-# Sample Shuffled Word List for bip39-solver-gpu
-# Target Address: 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy
+# Sample Shuffled Test Vector for BIP39 GPU Permutation Solver
+# Target Address: 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb
 #
-# Words in shuffled order (replace unknown words with '?'):
-smile
-match
-accuse
-guide
-craft
-asset
-boat
-crush
-?
-?
-?
-?
+# The exact same 12 seed words in shuffled/scrambled order:
+lottery
+absurd
+camera
+anxiety
+half
+scissors
+gather
+avoid
+army
+long
+category
+door
