@@ -18,15 +18,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Parser, Debug)]
 #[command(
     author = "BIP39 Solver GPU",
-    version = "0.5.0",
-    about = "GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses"
+    version = "0.6.0",
+    about = "GPU-accelerated BIP39 mnemonic solver & random seed scanner for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
     /// Target Bitcoin Base58 address, path to a .tsv/.txt file, or 'auto'
     #[arg(short, long, default_value = "auto")]
     address: String,
 
-    /// Path to text file containing 12 words, or 'auto' to auto-generate a random 12-word seed
+    /// Path to text file containing 12 words, or 'auto' for auto-generation / random seed scanner mode
     #[arg(short, long)]
     file: String,
 
@@ -310,13 +310,45 @@ fn main() {
     }
 
     let is_auto_file = args.file.to_lowercase() == "auto";
+    let is_auto_address = args.address.to_lowercase() == "auto";
+
+    // CASE A: --file auto AND custom --address (.txt / .tsv) -> GPU RANDOM SEED SCANNER MODE
+    if is_auto_file && !is_auto_address {
+        let targets = load_targets(&args.address);
+        let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
+        for t in &targets {
+            flat_target_bytes.extend_from_slice(&t.address_bytes);
+        }
+        let num_targets = targets.len() as u32;
+
+        println!("\n🚀 STARTING GPU RANDOM SEED SCANNER MODE");
+        println!("Target File/Address: '{}' ({} target address(es) loaded into GPU memory)", args.address, num_targets);
+        println!("Batch Size: {} seeds per GPU execution batch\n", args.batch_size);
+
+        let batch_size = args.batch_size;
+        let flat_bytes = flat_target_bytes.clone();
+
+        device_ids.into_par_iter().for_each(move |device_id| {
+            if let Err(e) = run_gpu_random_scanner(
+                platform_id,
+                device_id,
+                src_cstring.clone(),
+                &flat_bytes,
+                num_targets,
+                batch_size,
+            ) {
+                eprintln!("GPU Execution Error: {}", e);
+            }
+        });
+        return;
+    }
+
+    // CASE B: Single Auto Seed Test OR Word File Mode
     let mut words: Vec<String> = Vec::new();
-    let mut auto_derived_addr: Option<String> = None;
 
     if is_auto_file {
         let (ordered_words, hi, lo) = generate_auto_bip39_seed();
         let derived_addr = derive_gpu_address(platform_id, device_ids[0], src_cstring.clone(), hi, lo);
-        auto_derived_addr = Some(derived_addr.clone());
 
         if args.address.to_lowercase() == "auto" {
             args.address = derived_addr.clone();
@@ -364,27 +396,7 @@ fn main() {
     println!("Input Words (12): {:?}", word_refs);
 
     // 2. Load Target Addresses
-    let mut targets = load_targets(&args.address);
-
-    // If --file auto was used with a custom target address/file, include the auto-generated target address in search set
-    if let Some(ref auto_addr) = auto_derived_addr {
-        if args.address.to_lowercase() != "auto" {
-            if let Ok(b) = bs58::decode(auto_addr).into_vec() {
-                if b.len() == 25 {
-                    let mut arr = [0u8; 25];
-                    arr.copy_from_slice(&b);
-                    if !targets.iter().any(|t| t.address_bytes == arr) {
-                        println!("Note: Including auto-generated target address '{}' in active GPU search targets.", auto_addr);
-                        targets.push(TargetEntry {
-                            address_bytes: arr,
-                            address_str: auto_addr.clone(),
-                            balance_str: "Auto-Generated Test Seed".to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    let targets = load_targets(&args.address);
 
     let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
     for t in &targets {
@@ -486,6 +498,139 @@ fn main() {
                 eprintln!("GPU Execution Error: {}", e);
             }
         });
+    }
+}
+
+fn run_gpu_random_scanner(
+    platform_id: core::types::abs::PlatformId,
+    device_id: core::types::abs::DeviceId,
+    src: CString,
+    flat_target_bytes: &[u8],
+    num_targets: u32,
+    batch_size: u64,
+) -> ocl::core::Result<()> {
+    let context_properties = ContextProperties::new().platform(platform_id);
+    let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
+    let program = core::create_program_with_source(&context, &[src])?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let target_addresses_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            flat_target_bytes.len(),
+            Some(flat_target_bytes),
+        )?
+    };
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("[GPU Random Scanner] [{elapsed_precise}] {pos} seeds checked ({per_sec})")
+            .unwrap(),
+    );
+
+    let mut target_mnemonic = vec![0u8; 120];
+    let mut mnemonic_found = vec![0u8; 1];
+
+    let target_mnemonic_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+            120,
+            Some(&target_mnemonic),
+        )?
+    };
+
+    let mnemonic_found_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+            1,
+            Some(&mnemonic_found),
+        )?
+    };
+
+    let kernel = core::create_kernel(&program, "int_to_address")?;
+
+    loop {
+        let random_hi = get_random_u64();
+        let random_lo = get_random_u64();
+
+        let start_hi: cl_ulong = random_hi;
+        let start_lo: cl_ulong = random_lo;
+
+        // Reset found flag
+        mnemonic_found[0] = 0;
+        unsafe {
+            core::enqueue_write_buffer(
+                &queue,
+                &mnemonic_found_buf,
+                true,
+                0,
+                &mnemonic_found,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&start_hi))?;
+        core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&start_lo))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
+
+        unsafe {
+            core::enqueue_kernel(
+                &queue,
+                &kernel,
+                1,
+                None,
+                &[batch_size as usize, 1, 1],
+                None,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        unsafe {
+            core::enqueue_read_buffer(
+                &queue,
+                &mnemonic_found_buf,
+                true,
+                0,
+                &mut mnemonic_found,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        pb.inc(batch_size);
+
+        if mnemonic_found[0] == 0x01 {
+            unsafe {
+                core::enqueue_read_buffer(
+                    &queue,
+                    &target_mnemonic_buf,
+                    true,
+                    0,
+                    &mut target_mnemonic,
+                    None::<core::Event>,
+                    None::<&mut core::Event>,
+                )?;
+            }
+
+            pb.finish_with_message("MATCH FOUND!");
+            let s = String::from_utf8_lossy(&target_mnemonic).to_string();
+            let mnemonic = s.trim_matches(char::from(0));
+            println!("\n========================================");
+            println!("🎉 MATCH FOUND IN GPU RANDOM SCANNER!");
+            println!("Mnemonic: {}", mnemonic);
+            println!("========================================\n");
+            std::process::exit(0);
+        }
     }
 }
 
