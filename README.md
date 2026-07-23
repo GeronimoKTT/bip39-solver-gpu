@@ -2,11 +2,27 @@
 
 A modernized, high-performance GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses.
 
+## Modes of Operation
+
+### 1. Permutation Mode (Unordered 12 Words)
+If you know all 12 words of a BIP39 seed phrase but do **not know their exact order**, pass a file containing the 12 words without `?` wildcards.
+- The solver automatically generates all $12! = 479,001,600$ permutations.
+- Validates BIP39 4-bit checksums on the host CPU in milliseconds to filter out invalid combinations.
+- Parallel-evaluates valid candidate seed permutations on GPU devices to find the exact matching seed order for your target Bitcoin address.
+
+### 2. Wildcard Range Mode (Missing Words)
+If you know a portion of your 12-word seed in order (e.g. 8 to 11 words) and are missing the remaining words:
+- Replace missing word positions with `?` in your word file.
+- The solver iterates through the missing entropy search space on GPU devices to find the matching mnemonic phrase.
+
+---
+
 ## Features & Improvements
-- **Modernized Dependencies**: Updated to Rust Edition 2021 with modern crates (`clap`, `bs58`, `rayon`, `ocl`, `hex`). Removed legacy dependencies (`openssl-sys`, `rustc-serialize`, outdated custom crates).
-- **Standalone General Tool**: Removed hardcoded target transactions and old web server calls.
-- **Dynamic Address Input**: Pass any target Base58 Bitcoin address via `--address`.
-- **Flexible Wordlist File Input**: Pass a text file containing 12 words via `--file`. Use `?` for missing words.
+- **Modernized Toolchain**: Updated to Rust Edition 2021 with modern crates (`clap v4`, `bs58`, `rayon`, `ocl`, `hex`). Removed legacy dependencies (`openssl-sys`, `rustc-serialize`, outdated custom crates).
+- **Standalone CLI Tool**: Removed all hardcoded target addresses, hardcoded transactions, and legacy web server RPC calls.
+- **Dynamic Input**: Pass any target Base58 Bitcoin address via `--address` and any 12-word list file via `--file`.
+
+---
 
 ## Usage
 
@@ -15,29 +31,24 @@ A modernized, high-performance GPU-accelerated BIP39 mnemonic solver for Bitcoin
 cargo build --release
 ```
 
-### 2. Run
+### 2. Run Permutation Mode Example
+Test finding the correct 12-word order from a scrambled list:
 ```bash
-./target/release/bip39-solver-gpu --address <TARGET_ADDRESS> --file <PATH_TO_WORDS_FILE>
+./target/release/bip39-solver-gpu \
+  --address 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb \
+  --file sample_shuffled.txt
+```
+
+### 3. Run Wildcard Range Mode Example
+Search for missing words indicated by `?`:
+```bash
+./target/release/bip39-solver-gpu \
+  --address 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb \
+  --file sample_test.txt
 ```
 
 ### Command Line Options
-- `-a, --address <ADDRESS>`: Target Bitcoin Base58 address (e.g. `3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy`)
+- `-a, --address <ADDRESS>`: Target Bitcoin Base58 address (e.g. `3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb`)
 - `-f, --file <FILE>`: Path to text file containing 12 words (separated by spaces or newlines). Use `?` for missing words.
 - `-b, --batch-size <BATCH_SIZE>`: Batch size per GPU kernel iteration (default: `10000000`)
 - `-h, --help`: Print help information
-
-### Example `words.txt`
-```text
-abandon
-ability
-able
-about
-above
-absent
-absorb
-abstract
-?
-?
-?
-?
-```
