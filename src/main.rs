@@ -134,6 +134,19 @@ fn load_targets(address_input: &str) -> (Vec<u64>, Vec<u8>, u32, Vec<TargetEntry
     (target_prefixes, flat_target_bytes, num_targets, sorted_entries)
 }
 
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    let len = s.len();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
 fn get_random_u64() -> u64 {
     let mut bytes = [0u8; 8];
     if let Ok(mut f) = fs::File::open("/dev/urandom") {
@@ -555,9 +568,10 @@ fn run_gpu_random_scanner(
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
-            .template("[GPU Random Scanner] [{elapsed_precise}] {pos} seeds checked ({per_sec})")
+            .template("[GPU Random Scanner] [{elapsed_precise}] {msg} seeds checked ({per_sec})")
             .unwrap(),
     );
+    let mut total_checked: u64 = 0;
 
     let mut target_mnemonic = vec![0u8; 120];
     let mut mnemonic_found = vec![0u8; 1];
@@ -635,7 +649,9 @@ fn run_gpu_random_scanner(
             )?;
         }
 
+        total_checked += batch_size;
         pb.inc(batch_size);
+        pb.set_message(format_with_commas(total_checked));
 
         if mnemonic_found[0] == 0x01 {
             unsafe {
