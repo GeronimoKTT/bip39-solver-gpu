@@ -100,12 +100,12 @@ void uncompressed_public_key(extended_public_key_t *pub, uchar *serialized_key) 
   secp256k1_ec_pubkey_serialize(serialized_key, 65, &pub->public_key.key, SECP256K1_EC_UNCOMPRESSED);
 }
 
-void sha256d(uchar *input, int input_len, char * output) {
+void sha256d(const void *input, int input_len, void *output) {
   sha256(input, input_len, output);
   sha256(output, 32, output);
 }
 
-void hash160(uchar *input, int input_len, char * output) {
+void hash160(const void *input, int input_len, void *output) {
   uchar sha256_result[32] = { 0 };
   sha256(input, input_len, &sha256_result);
   ripemd160(&sha256_result, 32, output);

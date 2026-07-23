@@ -20,8 +20,9 @@ void ripemd160_Init(RIPEMD160_CTX *ctx)
     ctx->state[4] = 0xC3D2E1F0;
 }
 
-void ripemd160_process( RIPEMD160_CTX *ctx, const uint8_t data[64] )
+void ripemd160_process( RIPEMD160_CTX *ctx, const void *data_ptr )
 {
+    const uint8_t *data = (const uint8_t *)data_ptr;
     uint32_t A, B, C, D, E, Ap, Bp, Cp, Dp, Ep, X[16];
 
     GET_UINT32_LE( X[ 0], data,  0 );
@@ -266,8 +267,10 @@ void ripemd160_Final( RIPEMD160_CTX *ctx, uint8_t output[20] )
     memzero(ctx, sizeof(RIPEMD160_CTX));
 }
 
-void ripemd160(const uint8_t *msg, uint32_t msg_len, uint8_t hash[20])
+void ripemd160(const void *msg_ptr, uint32_t msg_len, void *hash_ptr)
 {
+    const uint8_t *msg = (const uint8_t *)msg_ptr;
+    uint8_t *hash = (uint8_t *)hash_ptr;
     RIPEMD160_CTX ctx;
     ripemd160_Init( &ctx );
     ripemd160_Update( &ctx, msg, msg_len );

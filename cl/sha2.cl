@@ -1,3 +1,16 @@
+#ifdef F1
+#undef F1
+#endif
+#ifdef F0
+#undef F0
+#endif
+#ifdef S0
+#undef S0
+#endif
+#ifdef S1
+#undef S1
+#endif
+
 #define F1(x,y,z) (bitselect(z,y,x))
 #define F0(x,y,z) (bitselect (x, y, ((x) ^ (z))))
 #define mod(x,y) ((x)-((x)/(y)*(y)))
@@ -278,10 +291,9 @@ static void sha512(unsigned long *input, const unsigned int length, ulong *hash)
   return;
 }
 
-static void sha256(__private const unsigned int *pass, int pass_len, __private unsigned int* hash) {
-  int plen=pass_len/4;
-  if (mod(pass_len,4)) plen++; 
-  __private unsigned int* p = hash;
+static void sha256(const void *input_ptr, int pass_len, void *output_ptr) {
+  const unsigned int *pass = (const unsigned int *)input_ptr;
+  unsigned int *p = (unsigned int *)output_ptr;
   unsigned int W[0x10]={0};
   int loops=plen;
   int curloop=0;
