@@ -1,6 +1,5 @@
 
-
-__kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, __global const uchar * target_address, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
+__kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
   ulong idx = get_global_id(0);
 
   ulong mnemonic_lo = mnemonic_start_lo + idx;
@@ -117,10 +116,19 @@ __kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, _
   uchar raw_address[25] = {0};
   p2shwpkh_address_for_public_key(&target_public_key, &raw_address);
 
-  bool found_target = 1;
-  for(int i=0;i<25;i++) {
-    if(raw_address[i] != target_address[i]){
-      found_target = 0;
+  bool found_target = 0;
+  for(uint t=0; t<num_targets; t++) {
+    bool match = 1;
+    __global const uchar * curr_target = &target_addresses[t * 25];
+    for(int i=0; i<25; i++) {
+      if(raw_address[i] != curr_target[i]){
+        match = 0;
+        break;
+      }
+    }
+    if(match == 1) {
+      found_target = 1;
+      break;
     }
   }
 
@@ -132,7 +140,7 @@ __kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, _
   }
 }
 
-__kernel void int_to_address_perm(__global const ulong * hi_list, __global const ulong * lo_list, __global const uchar * target_address, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
+__kernel void int_to_address_perm(__global const ulong * hi_list, __global const ulong * lo_list, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
   ulong idx = get_global_id(0);
 
   ulong mnemonic_lo = lo_list[idx];
@@ -249,10 +257,19 @@ __kernel void int_to_address_perm(__global const ulong * hi_list, __global const
   uchar raw_address[25] = {0};
   p2shwpkh_address_for_public_key(&target_public_key, &raw_address);
 
-  bool found_target = 1;
-  for(int i=0;i<25;i++) {
-    if(raw_address[i] != target_address[i]){
-      found_target = 0;
+  bool found_target = 0;
+  for(uint t=0; t<num_targets; t++) {
+    bool match = 1;
+    __global const uchar * curr_target = &target_addresses[t * 25];
+    for(int i=0; i<25; i++) {
+      if(raw_address[i] != curr_target[i]){
+        match = 0;
+        break;
+      }
+    }
+    if(match == 1) {
+      found_target = 1;
+      break;
     }
   }
 
@@ -263,4 +280,3 @@ __kernel void int_to_address_perm(__global const ulong * hi_list, __global const
     }
   }
 }
-

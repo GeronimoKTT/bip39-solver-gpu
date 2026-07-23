@@ -11,17 +11,18 @@ use ocl::core;
 use rayon::prelude::*;
 use std::ffi::CString;
 use std::fs;
+use std::path::Path;
 use std::str;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Parser, Debug)]
 #[command(
     author = "BIP39 Solver GPU",
-    version = "0.2.0",
+    version = "0.3.0",
     about = "GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
-    /// Target Bitcoin Base58 address (e.g. 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb)
+    /// Target Bitcoin Base58 address or path to a .tsv / .txt file containing address and balance columns
     #[arg(short, long)]
     address: String,
 
@@ -34,28 +35,92 @@ struct Args {
     batch_size: u64,
 }
 
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct TargetEntry {
+    address_bytes: [u8; 25],
+    address_str: String,
+    balance_str: String,
+}
+
+fn load_targets(address_input: &str) -> Vec<TargetEntry> {
+    let path = Path::new(address_input);
+    if path.exists() && path.is_file() {
+        let content = fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("Error reading address file '{}': {}", address_input, e);
+            std::process::exit(1);
+        });
+
+        let mut entries = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.to_lowercase().starts_with("address") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(&['\t', ',', ' '][..]).filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let addr_str = parts[0];
+            let bal_str = if parts.len() > 1 { parts[1].to_string() } else { "N/A".to_string() };
+
+            if let Ok(b) = bs58::decode(addr_str).into_vec() {
+                if b.len() == 25 {
+                    let mut arr = [0u8; 25];
+                    arr.copy_from_slice(&b);
+                    entries.push(TargetEntry {
+                        address_bytes: arr,
+                        address_str: addr_str.to_string(),
+                        balance_str: bal_str,
+                    });
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            eprintln!("Error: No valid 25-byte Base58 Bitcoin addresses found in file '{}'", address_input);
+            std::process::exit(1);
+        }
+
+        println!("Loaded {} target address(es) from TSV file '{}'. Loading into GPU memory...", entries.len(), address_input);
+        entries
+    } else {
+        // Single Base58 Address string
+        match bs58::decode(address_input).into_vec() {
+            Ok(b) if b.len() == 25 => {
+                let mut arr = [0u8; 25];
+                arr.copy_from_slice(&b);
+                println!("Target Address: {}", address_input);
+                println!("Target Address Bytes (hex): {}", hex::encode(&arr));
+                vec![TargetEntry {
+                    address_bytes: arr,
+                    address_str: address_input.to_string(),
+                    balance_str: "N/A".to_string(),
+                }]
+            }
+            Ok(b) => {
+                eprintln!("Error: Base58 decoded target address is {} bytes (expected 25 bytes)", b.len());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: Invalid Base58 address or file not found '{}': {}", address_input, e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    // 1. Decode Target Address from Base58Check
-    let target_addr_bytes = match bs58::decode(&args.address).into_vec() {
-        Ok(b) if b.len() == 25 => {
-            let mut arr = [0u8; 25];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        Ok(b) => {
-            eprintln!("Error: Base58 decoded target address is {} bytes (expected 25 bytes)", b.len());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error: Invalid Base58 address '{}': {}", args.address, e);
-            std::process::exit(1);
-        }
-    };
+    // 1. Load Target Addresses (single address or .tsv file)
+    let targets = load_targets(&args.address);
 
-    println!("Target Address: {}", args.address);
-    println!("Target Address Bytes (hex): {}", hex::encode(&target_addr_bytes));
+    let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
+    for t in &targets {
+        flat_target_bytes.extend_from_slice(&t.address_bytes);
+    }
+    let num_targets = targets.len() as u32;
 
     // 2. Load and Parse 12-Word List File
     let file_content = fs::read_to_string(&args.file).unwrap_or_else(|e| {
@@ -157,13 +222,15 @@ fn main() {
         println!("  [GPU {}] Device Name: {}", idx, name);
     }
 
+    let flat_bytes = flat_target_bytes.clone();
+
     if !has_wildcards {
         // MODE 1: PERMUTATION MODE (12 known words, unordered)
         println!("\n=== Running Mode: PERMUTATION MODE ===");
         println!("Generating and filtering permutations in parallel across CPU cores...");
 
         let candidate_pairs = generate_permutation_candidates_parallel(&words);
-        println!("Found {} valid BIP39 checksum candidates. Dispatching to GPU for address matching...", candidate_pairs.len());
+        println!("Found {} valid BIP39 checksum candidates. Pre-loading target address buffer into GPU memory...", candidate_pairs.len());
 
         let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
         let batch_size = args.batch_size;
@@ -175,7 +242,8 @@ fn main() {
                 device_id,
                 src_cstring.clone(),
                 kernel_name,
-                target_addr_bytes,
+                &flat_bytes,
+                num_targets,
                 &hi_list,
                 &lo_list,
                 batch_size,
@@ -238,7 +306,8 @@ fn main() {
                 device_id,
                 src_cstring.clone(),
                 kernel_name,
-                target_addr_bytes,
+                &flat_bytes,
+                num_targets,
                 start_entropy,
                 total_space,
                 batch_size,
@@ -348,7 +417,6 @@ fn generate_permutation_candidates_parallel(words: &[&str]) -> Vec<(u64, u64)> {
 
     let progress_counter = AtomicU64::new(0);
 
-    // Parallelize over the 12 choices for the first position
     let candidate_chunks: Vec<Vec<(u64, u64)>> = (0..12)
         .into_par_iter()
         .map(|first_idx| {
@@ -432,7 +500,8 @@ fn mnemonic_gpu_perm(
     device_id: core::types::abs::DeviceId,
     src: CString,
     kernel_name: &str,
-    target_addr_bytes: [u8; 25],
+    flat_target_bytes: &[u8],
+    num_targets: u32,
     hi_list: &[u64],
     lo_list: &[u64],
     batch_size: u64,
@@ -443,12 +512,12 @@ fn mnemonic_gpu_perm(
     core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
 
-    let target_address_buf = unsafe {
+    let target_addresses_buf = unsafe {
         core::create_buffer(
             &context,
             flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
-            25,
-            Some(&target_addr_bytes),
+            flat_target_bytes.len(),
+            Some(flat_target_bytes),
         )?
     };
 
@@ -511,9 +580,10 @@ fn mnemonic_gpu_perm(
 
         core::set_kernel_arg(&kernel, 0, ArgVal::mem(&hi_buf))?;
         core::set_kernel_arg(&kernel, 1, ArgVal::mem(&lo_buf))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_address_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&mnemonic_found_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
 
         unsafe {
             core::enqueue_kernel(
@@ -559,7 +629,7 @@ fn mnemonic_gpu_perm(
             let s = String::from_utf8_lossy(&target_mnemonic).to_string();
             let mnemonic = s.trim_matches(char::from(0));
             println!("\n========================================");
-            println!("🎉 MNEMONIC PERMUTATION FOUND!");
+            println!("🎉 MNEMONIC MATCH FOUND!");
             println!("Mnemonic: {}", mnemonic);
             println!("========================================\n");
             std::process::exit(0);
@@ -577,7 +647,8 @@ fn mnemonic_gpu_range(
     device_id: core::types::abs::DeviceId,
     src: CString,
     kernel_name: &str,
-    target_addr_bytes: [u8; 25],
+    flat_target_bytes: &[u8],
+    num_targets: u32,
     start_entropy: u128,
     total_space: u64,
     batch_size: u64,
@@ -588,12 +659,12 @@ fn mnemonic_gpu_range(
     core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
 
-    let target_address_buf = unsafe {
+    let target_addresses_buf = unsafe {
         core::create_buffer(
             &context,
             flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
-            25,
-            Some(&target_addr_bytes),
+            flat_target_bytes.len(),
+            Some(flat_target_bytes),
         )?
     };
 
@@ -639,9 +710,10 @@ fn mnemonic_gpu_range(
 
         core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&start_hi))?;
         core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&start_lo))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_address_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&mnemonic_found_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
 
         unsafe {
             core::enqueue_kernel(
@@ -687,7 +759,7 @@ fn mnemonic_gpu_range(
             let s = String::from_utf8_lossy(&target_mnemonic).to_string();
             let mnemonic = s.trim_matches(char::from(0));
             println!("\n========================================");
-            println!("🎉 MNEMONIC FOUND!");
+            println!("🎉 MNEMONIC MATCH FOUND!");
             println!("Mnemonic: {}", mnemonic);
             println!("========================================\n");
             std::process::exit(0);
