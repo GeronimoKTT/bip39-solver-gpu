@@ -291,6 +291,151 @@ static void sha512(unsigned long *input, const unsigned int length, ulong *hash)
   return;
 }
 
+static void sha512_block_raw(ulong State[8], const ulong * block_w) {
+    ulong W[80];
+    W[0] = SWAP512(block_w[0]);
+    W[1] = SWAP512(block_w[1]);
+    W[2] = SWAP512(block_w[2]);
+    W[3] = SWAP512(block_w[3]);
+    W[4] = SWAP512(block_w[4]);
+    W[5] = SWAP512(block_w[5]);
+    W[6] = SWAP512(block_w[6]);
+    W[7] = SWAP512(block_w[7]);
+    W[8] = SWAP512(block_w[8]);
+    W[9] = SWAP512(block_w[9]);
+    W[10] = SWAP512(block_w[10]);
+    W[11] = SWAP512(block_w[11]);
+    W[12] = SWAP512(block_w[12]);
+    W[13] = SWAP512(block_w[13]);
+    W[14] = SWAP512(block_w[14]);
+    W[15] = SWAP512(block_w[15]);
+
+    for (int i = 16; i < 80; i++) {
+      W[i] = W[i-16] + little_s0(W[i-15]) + W[i-7] + little_s1(W[i-2]);
+    }
+
+    ulong a = State[0];
+    ulong b = State[1];
+    ulong c = State[2];
+    ulong d = State[3];
+    ulong e = State[4];
+    ulong f = State[5];
+    ulong g = State[6];
+    ulong h = State[7];
+
+    for (int i = 0; i < 80; i += 16) {
+      ROUND_STEP_SHA512(i)
+    }
+
+    State[0] += a;
+    State[1] += b;
+    State[2] += c;
+    State[3] += d;
+    State[4] += e;
+    State[5] += f;
+    State[6] += g;
+    State[7] += h;
+}
+
+static void pbkdf2_hmac_sha512_fast(const uchar *mnemonic, int mnemonic_len, uchar *out_seed) {
+    ulong ipad_key[16] = {0};
+    ulong opad_key[16] = {0};
+
+    uchar *ipad_bytes = (uchar *)ipad_key;
+    uchar *opad_bytes = (uchar *)opad_key;
+
+    for (int x = 0; x < 128; x++) {
+        ipad_bytes[x] = 0x36;
+        opad_bytes[x] = 0x5c;
+    }
+    for (int x = 0; x < mnemonic_len; x++) {
+        ipad_bytes[x] ^= mnemonic[x];
+        opad_bytes[x] ^= mnemonic[x];
+    }
+
+    // Pre-calculate midstates after Block 0 (ipad_key and opad_key)
+    ulong state_ipad[8] = {
+        0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL, 0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL,
+        0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL, 0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL
+    };
+    ulong state_opad[8] = {
+        0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL, 0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL,
+        0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL, 0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL
+    };
+
+    sha512_block_raw(state_ipad, ipad_key);
+    sha512_block_raw(state_opad, opad_key);
+
+    // Round 1: Message = salt[12] ("mnemonic\0\0\0\x01")
+    ulong block1_inner[16] = {0};
+    uchar *b1_inner_bytes = (uchar *)block1_inner;
+    uchar salt[12] = { 109, 110, 101, 109, 111, 110, 105, 99, 0, 0, 0, 1 };
+    for (int i = 0; i < 12; i++) {
+        b1_inner_bytes[i] = salt[i];
+    }
+    b1_inner_bytes[12] = 0x80;
+    block1_inner[15] = SWAP512(1120UL);
+
+    ulong inner_state[8];
+    for (int i = 0; i < 8; i++) inner_state[i] = state_ipad[i];
+    sha512_block_raw(inner_state, block1_inner);
+
+    // Outer Round 1
+    ulong block1_outer[16] = {0};
+    for (int i = 0; i < 8; i++) {
+        block1_outer[i] = SWAP512(inner_state[i]);
+    }
+    uchar *b1_outer_bytes = (uchar *)block1_outer;
+    b1_outer_bytes[64] = 0x80;
+    block1_outer[15] = SWAP512(1536UL);
+
+    ulong outer_state[8];
+    for (int i = 0; i < 8; i++) outer_state[i] = state_opad[i];
+    sha512_block_raw(outer_state, block1_outer);
+
+    ulong seed_u64[8];
+    for (int i = 0; i < 8; i++) {
+        seed_u64[i] = outer_state[i];
+    }
+
+    // Rounds 2 to 2048 (Single block transform per inner & outer!)
+    for (int r = 1; r < 2048; r++) {
+        // Inner
+        for (int i = 0; i < 8; i++) {
+            block1_inner[i] = SWAP512(outer_state[i]);
+        }
+        b1_inner_bytes[64] = 0x80;
+        block1_inner[15] = SWAP512(1536UL);
+
+        for (int i = 0; i < 8; i++) inner_state[i] = state_ipad[i];
+        sha512_block_raw(inner_state, block1_inner);
+
+        // Outer
+        for (int i = 0; i < 8; i++) {
+            block1_outer[i] = SWAP512(inner_state[i]);
+        }
+        b1_outer_bytes[64] = 0x80;
+        block1_outer[15] = SWAP512(1536UL);
+
+        for (int i = 0; i < 8; i++) outer_state[i] = state_opad[i];
+        sha512_block_raw(outer_state, block1_outer);
+
+        // Accumulate XOR
+        for (int i = 0; i < 8; i++) {
+            seed_u64[i] ^= outer_state[i];
+        }
+    }
+
+    // Store 64-byte seed
+    for (int i = 0; i < 8; i++) {
+        ulong word = SWAP512(seed_u64[i]);
+        uchar *w_bytes = (uchar *)&word;
+        for (int j = 0; j < 8; j++) {
+            out_seed[i * 8 + j] = w_bytes[j];
+        }
+    }
+}
+
 static void sha256(const void *input_ptr, int pass_len, void *output_ptr) {
   const unsigned int *pass = (const unsigned int *)input_ptr;
   unsigned int *p = (unsigned int *)output_ptr;

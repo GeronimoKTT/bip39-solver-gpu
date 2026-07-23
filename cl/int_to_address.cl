@@ -59,41 +59,9 @@ __kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, _
   }
   mnemonic[mnemonic_index - 1] = 0;
 
-  uchar ipad_key[128];
-  uchar opad_key[128];
-  for(int x=0;x<128;x++){
-    ipad_key[x] = 0x36;
-    opad_key[x] = 0x5c;
-  }
-
-  for(int x=0;x<mnemonic_length;x++){
-    ipad_key[x] = ipad_key[x] ^ mnemonic[x];
-    opad_key[x] = opad_key[x] ^ mnemonic[x];
-  }
-
+  // Fast Midstate PBKDF2 HMAC-SHA512 (pre-calculated salt state & single block transforms per round)
   uchar seed[64] = { 0 };
-  uchar sha512_result[64] = { 0 };
-  uchar key_previous_concat[256] = { 0 };
-  uchar salt[12] = { 109, 110, 101, 109, 111, 110, 105, 99, 0, 0, 0, 1 };
-  for(int x=0;x<128;x++){
-    key_previous_concat[x] = ipad_key[x];
-  }
-  for(int x=0;x<12;x++){
-    key_previous_concat[x+128] = salt[x];
-  }
-
-  sha512(&key_previous_concat, 140, &sha512_result);
-  copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-  sha512(&key_previous_concat, 192, &sha512_result);
-  xor_seed_with_round(&seed, &sha512_result);
-
-  for(int x=1;x<2048;x++){
-    copy_pad_previous(&ipad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    xor_seed_with_round(&seed, &sha512_result);
-  }
+  pbkdf2_hmac_sha512_fast(mnemonic, mnemonic_length, seed);
 
   uchar network = BITCOIN_MAINNET;
   extended_private_key_t master_private;
@@ -247,41 +215,9 @@ __kernel void int_to_address_perm(__global const ulong * hi_list, __global const
   }
   mnemonic[mnemonic_index - 1] = 0;
 
-  uchar ipad_key[128];
-  uchar opad_key[128];
-  for(int x=0;x<128;x++){
-    ipad_key[x] = 0x36;
-    opad_key[x] = 0x5c;
-  }
-
-  for(int x=0;x<mnemonic_length;x++){
-    ipad_key[x] = ipad_key[x] ^ mnemonic[x];
-    opad_key[x] = opad_key[x] ^ mnemonic[x];
-  }
-
+  // Fast Midstate PBKDF2 HMAC-SHA512
   uchar seed[64] = { 0 };
-  uchar sha512_result[64] = { 0 };
-  uchar key_previous_concat[256] = { 0 };
-  uchar salt[12] = { 109, 110, 101, 109, 111, 110, 105, 99, 0, 0, 0, 1 };
-  for(int x=0;x<128;x++){
-    key_previous_concat[x] = ipad_key[x];
-  }
-  for(int x=0;x<12;x++){
-    key_previous_concat[x+128] = salt[x];
-  }
-
-  sha512(&key_previous_concat, 140, &sha512_result);
-  copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-  sha512(&key_previous_concat, 192, &sha512_result);
-  xor_seed_with_round(&seed, &sha512_result);
-
-  for(int x=1;x<2048;x++){
-    copy_pad_previous(&ipad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    xor_seed_with_round(&seed, &sha512_result);
-  }
+  pbkdf2_hmac_sha512_fast(mnemonic, mnemonic_length, seed);
 
   uchar network = BITCOIN_MAINNET;
   extended_private_key_t master_private;
@@ -430,41 +366,9 @@ __kernel void get_address_for_entropy(ulong mnemonic_hi, ulong mnemonic_lo, __gl
   }
   mnemonic[mnemonic_index - 1] = 0;
 
-  uchar ipad_key[128];
-  uchar opad_key[128];
-  for(int x=0;x<128;x++){
-    ipad_key[x] = 0x36;
-    opad_key[x] = 0x5c;
-  }
-
-  for(int x=0;x<mnemonic_length;x++){
-    ipad_key[x] = ipad_key[x] ^ mnemonic[x];
-    opad_key[x] = opad_key[x] ^ mnemonic[x];
-  }
-
+  // Fast Midstate PBKDF2 HMAC-SHA512
   uchar seed[64] = { 0 };
-  uchar sha512_result[64] = { 0 };
-  uchar key_previous_concat[256] = { 0 };
-  uchar salt[12] = { 109, 110, 101, 109, 111, 110, 105, 99, 0, 0, 0, 1 };
-  for(int x=0;x<128;x++){
-    key_previous_concat[x] = ipad_key[x];
-  }
-  for(int x=0;x<12;x++){
-    key_previous_concat[x+128] = salt[x];
-  }
-
-  sha512(&key_previous_concat, 140, &sha512_result);
-  copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-  sha512(&key_previous_concat, 192, &sha512_result);
-  xor_seed_with_round(&seed, &sha512_result);
-
-  for(int x=1;x<2048;x++){
-    copy_pad_previous(&ipad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    copy_pad_previous(&opad_key, &sha512_result, &key_previous_concat);
-    sha512(&key_previous_concat, 192, &sha512_result);
-    xor_seed_with_round(&seed, &sha512_result);
-  }
+  pbkdf2_hmac_sha512_fast(mnemonic, mnemonic_length, seed);
 
   uchar network = BITCOIN_MAINNET;
   extended_private_key_t master_private;
