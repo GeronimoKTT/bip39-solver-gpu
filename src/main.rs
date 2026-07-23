@@ -120,7 +120,18 @@ fn main() {
     let platform_id = match core::default_platform() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("OpenCL Error: No default platform found ({})", e);
+            eprintln!("\n❌ OpenCL Error: No default platform found ({})", e);
+            eprintln!("\n💡 TROUBLESHOOTING OPENCL ON NVIDIA / CUDA CONTAINERS:");
+            eprintln!("--------------------------------------------------------------------------------");
+            eprintln!("1. Enable NVIDIA OpenCL ICD inside your container:");
+            eprintln!("   mkdir -p /etc/OpenCL/vendors && echo \"libnvidia-opencl.so.1\" > /etc/OpenCL/vendors/nvidia.icd");
+            eprintln!("2. If running Docker, make sure you started it with `--gpus all`:");
+            eprintln!("   docker run --gpus all -it ...");
+            eprintln!("3. Install OpenCL ICD packages if missing:");
+            eprintln!("   apt-get update && apt-get install -y ocl-icd-opencl-dev clinfo");
+            eprintln!("4. Test OpenCL detection using:");
+            eprintln!("   clinfo");
+            eprintln!("--------------------------------------------------------------------------------\n");
             std::process::exit(1);
         }
     };
