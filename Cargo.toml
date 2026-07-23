@@ -9,3 +9,4 @@ rayon = "1.10"
 clap = { version = "4.4", features = ["derive"] }
 bs58 = "0.5"
 hex = "0.4"
+indicatif = "0.17"

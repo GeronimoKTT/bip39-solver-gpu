@@ -2,6 +2,7 @@ mod bip39;
 
 use clap::Parser;
 use hex;
+use indicatif::{ProgressBar, ProgressStyle};
 use ocl::builders::ContextProperties;
 use ocl::enums::ArgVal;
 use ocl::flags;
@@ -11,6 +12,7 @@ use rayon::prelude::*;
 use std::ffi::CString;
 use std::fs;
 use std::str;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -19,7 +21,7 @@ use std::str;
     about = "GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
-    /// Target Bitcoin Base58 address (e.g. 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy)
+    /// Target Bitcoin Base58 address (e.g. 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb)
     #[arg(short, long)]
     address: String,
 
@@ -147,15 +149,21 @@ fn main() {
         },
     };
 
-    println!("Found {} OpenCL device(s).", device_ids.len());
+    println!("\nFound {} OpenCL device(s).", device_ids.len());
+    for (idx, dev) in device_ids.iter().enumerate() {
+        let name = core::get_device_info(dev, ocl::core::DeviceInfo::Name)
+            .map(|info| info.to_string())
+            .unwrap_or_else(|_| "GPU Device".to_string());
+        println!("  [GPU {}] Device Name: {}", idx, name);
+    }
 
     if !has_wildcards {
         // MODE 1: PERMUTATION MODE (12 known words, unordered)
         println!("\n=== Running Mode: PERMUTATION MODE ===");
-        println!("Generating permutations of all 12 words and filtering valid BIP39 checksums...");
+        println!("Generating and filtering permutations in parallel across CPU cores...");
 
-        let candidate_pairs = generate_permutation_candidates(&words);
-        println!("Found {} valid BIP39 candidate permutations to check on GPU.", candidate_pairs.len());
+        let candidate_pairs = generate_permutation_candidates_parallel(&words);
+        println!("Found {} valid BIP39 checksum candidates. Dispatching to GPU for address matching...", candidate_pairs.len());
 
         let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
         let batch_size = args.batch_size;
@@ -243,7 +251,6 @@ fn main() {
 
 /// Simple Sha256 helper for host-side checksum validation
 fn simple_sha256(data: &[u8]) -> [u8; 32] {
-    // Sha256 implementation for 16-byte buffer
     use std::num::Wrapping;
 
     let k: [u32; 64] = [
@@ -321,8 +328,8 @@ fn simple_sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn generate_permutation_candidates(words: &[&str]) -> Vec<(u64, u64)> {
-    let mut indices: Vec<u16> = words
+fn generate_permutation_candidates_parallel(words: &[&str]) -> Vec<(u64, u64)> {
+    let word_indices: Vec<u16> = words
         .iter()
         .map(|w| bip39::get_word_index(w).unwrap_or_else(|| {
             eprintln!("Error: Unknown BIP39 word '{}'", w);
@@ -330,38 +337,74 @@ fn generate_permutation_candidates(words: &[&str]) -> Vec<(u64, u64)> {
         }) as u16)
         .collect();
 
-    indices.sort_unstable(); // Lexicographical sort
+    let total_perms: u64 = 479_001_600; // 12!
+    let pb = ProgressBar::new(total_perms);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[CPU Prep] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
-    let mut candidates = Vec::new();
+    let progress_counter = AtomicU64::new(0);
 
-    loop {
-        // Construct 16-byte entropy buffer from indices
-        let mut entropy_128: u128 = 0;
-        for (i, &idx) in indices.iter().take(11).enumerate() {
-            let shift = 117 - i * 11;
-            entropy_128 |= (idx as u128) << shift;
-        }
-        entropy_128 |= (indices[11] >> 4) as u128;
+    // Parallelize over the 12 choices for the first position
+    let candidate_chunks: Vec<Vec<(u64, u64)>> = (0..12)
+        .into_par_iter()
+        .map(|first_idx| {
+            let mut sub_indices = Vec::with_capacity(11);
+            for (idx, &w) in word_indices.iter().enumerate() {
+                if idx != first_idx {
+                    sub_indices.push(w);
+                }
+            }
+            sub_indices.sort_unstable();
 
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&entropy_128.to_be_bytes());
+            let mut local_candidates = Vec::new();
+            let mut perm_count = 0u64;
 
-        let sha_res = simple_sha256(&bytes);
-        let expected_checksum = (sha_res[0] >> 4) & 0x0F;
-        let actual_checksum = (indices[11] & 0x0F) as u8;
+            loop {
+                let mut current_perm = [0u16; 12];
+                current_perm[0] = word_indices[first_idx];
+                current_perm[1..].copy_from_slice(&sub_indices);
 
-        if expected_checksum == actual_checksum {
-            let hi = (entropy_128 >> 64) as u64;
-            let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
-            candidates.push((hi, lo));
-        }
+                let mut entropy_128: u128 = 0;
+                for (i, &idx) in current_perm.iter().take(11).enumerate() {
+                    let shift = 117 - i * 11;
+                    entropy_128 |= (idx as u128) << shift;
+                }
+                entropy_128 |= (current_perm[11] >> 4) as u128;
 
-        if !next_permutation(&mut indices) {
-            break;
-        }
-    }
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&entropy_128.to_be_bytes());
 
-    candidates
+                let sha_res = simple_sha256(&bytes);
+                let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+                let actual_checksum = (current_perm[11] & 0x0F) as u8;
+
+                if expected_checksum == actual_checksum {
+                    let hi = (entropy_128 >> 64) as u64;
+                    let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                    local_candidates.push((hi, lo));
+                }
+
+                perm_count += 1;
+                if perm_count % 100_000 == 0 {
+                    progress_counter.fetch_add(100_000, Ordering::Relaxed);
+                }
+
+                if !next_permutation(&mut sub_indices) {
+                    break;
+                }
+            }
+
+            local_candidates
+        })
+        .collect();
+
+    pb.finish_with_message("Permutation pre-filtering complete.");
+
+    candidate_chunks.into_iter().flatten().collect()
 }
 
 fn next_permutation<T: Ord>(arr: &mut [T]) -> bool {
@@ -410,6 +453,14 @@ fn mnemonic_gpu_perm(
     };
 
     let total_candidates = hi_list.len();
+    let pb = ProgressBar::new(total_candidates as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[GPU Process] [{elapsed_precise}] [{bar:40.green/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
     let mut offset = 0;
 
     while offset < total_candidates {
@@ -501,7 +552,10 @@ fn mnemonic_gpu_perm(
             )?;
         }
 
+        pb.inc(chunk_len as u64);
+
         if mnemonic_found[0] == 0x01 {
+            pb.finish_with_message("MATCH FOUND!");
             let s = String::from_utf8_lossy(&target_mnemonic).to_string();
             let mnemonic = s.trim_matches(char::from(0));
             println!("\n========================================");
@@ -514,6 +568,7 @@ fn mnemonic_gpu_perm(
         offset += chunk_len;
     }
 
+    pb.finish_with_message("GPU processing finished.");
     Ok(())
 }
 
@@ -541,6 +596,14 @@ fn mnemonic_gpu_range(
             Some(&target_addr_bytes),
         )?
     };
+
+    let pb = ProgressBar::new(total_space);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[GPU Range Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     let mut current_offset: u128 = 0;
     let max_offset = total_space as u128;
@@ -617,7 +680,10 @@ fn mnemonic_gpu_range(
             )?;
         }
 
+        pb.inc(current_batch);
+
         if mnemonic_found[0] == 0x01 {
+            pb.finish_with_message("MATCH FOUND!");
             let s = String::from_utf8_lossy(&target_mnemonic).to_string();
             let mnemonic = s.trim_matches(char::from(0));
             println!("\n========================================");
@@ -630,5 +696,6 @@ fn mnemonic_gpu_range(
         current_offset += current_batch as u128;
     }
 
+    pb.finish_with_message("GPU Range Search complete.");
     Ok(())
 }
