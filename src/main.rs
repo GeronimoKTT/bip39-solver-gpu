@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Parser, Debug)]
 #[command(
     author = "BIP39 Solver GPU",
-    version = "0.4.0",
+    version = "0.5.0",
     about = "GPU-accelerated BIP39 mnemonic solver for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
@@ -311,10 +311,12 @@ fn main() {
 
     let is_auto_file = args.file.to_lowercase() == "auto";
     let mut words: Vec<String> = Vec::new();
+    let mut auto_derived_addr: Option<String> = None;
 
     if is_auto_file {
         let (ordered_words, hi, lo) = generate_auto_bip39_seed();
         let derived_addr = derive_gpu_address(platform_id, device_ids[0], src_cstring.clone(), hi, lo);
+        auto_derived_addr = Some(derived_addr.clone());
 
         if args.address.to_lowercase() == "auto" {
             args.address = derived_addr.clone();
@@ -362,7 +364,27 @@ fn main() {
     println!("Input Words (12): {:?}", word_refs);
 
     // 2. Load Target Addresses
-    let targets = load_targets(&args.address);
+    let mut targets = load_targets(&args.address);
+
+    // If --file auto was used with a custom target address/file, include the auto-generated target address in search set
+    if let Some(ref auto_addr) = auto_derived_addr {
+        if args.address.to_lowercase() != "auto" {
+            if let Ok(b) = bs58::decode(auto_addr).into_vec() {
+                if b.len() == 25 {
+                    let mut arr = [0u8; 25];
+                    arr.copy_from_slice(&b);
+                    if !targets.iter().any(|t| t.address_bytes == arr) {
+                        println!("Note: Including auto-generated target address '{}' in active GPU search targets.", auto_addr);
+                        targets.push(TargetEntry {
+                            address_bytes: arr,
+                            address_str: auto_addr.clone(),
+                            balance_str: "Auto-Generated Test Seed".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
     for t in &targets {
@@ -379,7 +401,7 @@ fn main() {
         println!("Generating and filtering permutations in parallel across CPU cores...");
 
         let candidate_pairs = generate_permutation_candidates_parallel(&word_refs);
-        println!("Found {} valid BIP39 checksum candidates. Pre-loading target address buffer into GPU memory...", candidate_pairs.len());
+        println!("Found {} valid BIP39 checksum candidates. Pre-loading {} target address(es) into GPU memory...", candidate_pairs.len(), num_targets);
 
         let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
         let batch_size = args.batch_size;
