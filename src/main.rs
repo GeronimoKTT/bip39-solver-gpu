@@ -31,7 +31,7 @@ struct Args {
     file: String,
 
     /// Batch size per GPU kernel execution
-    #[arg(short, long, default_value_t = 10_000_000)]
+    #[arg(short, long, default_value_t = 100_000_000)]
     batch_size: u64,
 }
 

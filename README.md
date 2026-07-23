@@ -74,5 +74,5 @@ cargo build --release
 ### Command Line Options
 - `-a, --address <ADDRESS>`: Target Bitcoin Base58 address, `.tsv`/`.txt` file, or `auto` (default: `auto`).
 - `-f, --file <FILE>`: Path to 12-word text file, OR `auto` for random seed generation / GPU scanner mode.
-- `-b, --batch-size <BATCH_SIZE>`: Batch size per GPU kernel iteration (default: `10000000`).
+- `-b, --batch-size <BATCH_SIZE>`: Batch size per GPU kernel iteration (default: `100000000`).
 - `-h, --help`: Print help information.
