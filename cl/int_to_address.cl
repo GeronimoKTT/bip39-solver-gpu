@@ -1,5 +1,5 @@
 
-__kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
+__kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, __global const ulong * target_prefixes, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
   ulong idx = get_global_id(0);
 
   ulong mnemonic_lo = mnemonic_start_lo + idx;
@@ -116,31 +116,78 @@ __kernel void int_to_address(ulong mnemonic_start_hi, ulong mnemonic_start_lo, _
   uchar raw_address[25] = {0};
   p2shwpkh_address_for_public_key(&target_public_key, &raw_address);
 
+  ulong key = ((ulong)raw_address[1] << 56) |
+              ((ulong)raw_address[2] << 48) |
+              ((ulong)raw_address[3] << 40) |
+              ((ulong)raw_address[4] << 32) |
+              ((ulong)raw_address[5] << 24) |
+              ((ulong)raw_address[6] << 16) |
+              ((ulong)raw_address[7] << 8)  |
+              (ulong)raw_address[8];
+
   bool found_target = 0;
-  for(uint t=0; t<num_targets; t++) {
-    bool match = 1;
-    __global const uchar * curr_target = &target_addresses[t * 25];
-    for(int i=0; i<25; i++) {
-      if(raw_address[i] != curr_target[i]){
-        match = 0;
+  int low = 0;
+  int high = (int)num_targets - 1;
+
+  while (low <= high) {
+    int mid = low + ((high - low) >> 1);
+    ulong mid_val = target_prefixes[mid];
+
+    if (mid_val == key) {
+      bool match = 1;
+      __global const uchar * curr_target = &target_addresses[mid * 25];
+      for (int i = 0; i < 25; i++) {
+        if (raw_address[i] != curr_target[i]) {
+          match = 0;
+          break;
+        }
+      }
+      if (match == 1) {
+        found_target = 1;
         break;
       }
-    }
-    if(match == 1) {
-      found_target = 1;
+
+      int l = mid - 1;
+      while (l >= 0 && target_prefixes[l] == key) {
+        match = 1;
+        curr_target = &target_addresses[l * 25];
+        for (int i = 0; i < 25; i++) {
+          if (raw_address[i] != curr_target[i]) { match = 0; break; }
+        }
+        if (match == 1) { found_target = 1; break; }
+        l--;
+      }
+      if (found_target == 1) break;
+
+      int r = mid + 1;
+      while (r < (int)num_targets && target_prefixes[r] == key) {
+        match = 1;
+        curr_target = &target_addresses[r * 25];
+        for (int i = 0; i < 25; i++) {
+          if (raw_address[i] != curr_target[i]) { match = 0; break; }
+        }
+        if (match == 1) { found_target = 1; break; }
+        r++;
+      }
+      if (found_target == 1) break;
+
       break;
+    } else if (mid_val < key) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
   }
 
   if(found_target == 1) {
     found_mnemonic[0] = 0x01;
-    for(int i=0;i<mnemonic_index;i++) {
+    for(int i=0; i<mnemonic_index; i++) {
       target_mnemonic[i] = mnemonic[i];
     }
   }
 }
 
-__kernel void int_to_address_perm(__global const ulong * hi_list, __global const ulong * lo_list, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
+__kernel void int_to_address_perm(__global const ulong * hi_list, __global const ulong * lo_list, __global const ulong * target_prefixes, __global const uchar * target_addresses, uint num_targets, __global uchar * target_mnemonic, __global uchar * found_mnemonic) {
   ulong idx = get_global_id(0);
 
   ulong mnemonic_lo = lo_list[idx];
@@ -257,25 +304,72 @@ __kernel void int_to_address_perm(__global const ulong * hi_list, __global const
   uchar raw_address[25] = {0};
   p2shwpkh_address_for_public_key(&target_public_key, &raw_address);
 
+  ulong key = ((ulong)raw_address[1] << 56) |
+              ((ulong)raw_address[2] << 48) |
+              ((ulong)raw_address[3] << 40) |
+              ((ulong)raw_address[4] << 32) |
+              ((ulong)raw_address[5] << 24) |
+              ((ulong)raw_address[6] << 16) |
+              ((ulong)raw_address[7] << 8)  |
+              (ulong)raw_address[8];
+
   bool found_target = 0;
-  for(uint t=0; t<num_targets; t++) {
-    bool match = 1;
-    __global const uchar * curr_target = &target_addresses[t * 25];
-    for(int i=0; i<25; i++) {
-      if(raw_address[i] != curr_target[i]){
-        match = 0;
+  int low = 0;
+  int high = (int)num_targets - 1;
+
+  while (low <= high) {
+    int mid = low + ((high - low) >> 1);
+    ulong mid_val = target_prefixes[mid];
+
+    if (mid_val == key) {
+      bool match = 1;
+      __global const uchar * curr_target = &target_addresses[mid * 25];
+      for (int i = 0; i < 25; i++) {
+        if (raw_address[i] != curr_target[i]) {
+          match = 0;
+          break;
+        }
+      }
+      if (match == 1) {
+        found_target = 1;
         break;
       }
-    }
-    if(match == 1) {
-      found_target = 1;
+
+      int l = mid - 1;
+      while (l >= 0 && target_prefixes[l] == key) {
+        match = 1;
+        curr_target = &target_addresses[l * 25];
+        for (int i = 0; i < 25; i++) {
+          if (raw_address[i] != curr_target[i]) { match = 0; break; }
+        }
+        if (match == 1) { found_target = 1; break; }
+        l--;
+      }
+      if (found_target == 1) break;
+
+      int r = mid + 1;
+      while (r < (int)num_targets && target_prefixes[r] == key) {
+        match = 1;
+        curr_target = &target_addresses[r * 25];
+        for (int i = 0; i < 25; i++) {
+          if (raw_address[i] != curr_target[i]) { match = 0; break; }
+        }
+        if (match == 1) { found_target = 1; break; }
+        r++;
+      }
+      if (found_target == 1) break;
+
       break;
+    } else if (mid_val < key) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
     }
   }
 
   if(found_target == 1) {
     found_mnemonic[0] = 0x01;
-    for(int i=0;i<mnemonic_index;i++) {
+    for(int i=0; i<mnemonic_index; i++) {
       target_mnemonic[i] = mnemonic[i];
     }
   }

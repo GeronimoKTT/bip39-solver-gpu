@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Parser, Debug)]
 #[command(
     author = "BIP39 Solver GPU",
-    version = "0.6.0",
+    version = "0.7.0",
     about = "GPU-accelerated BIP39 mnemonic solver & random seed scanner for Bitcoin P2SH-P2WPKH addresses"
 )]
 struct Args {
@@ -43,7 +43,7 @@ struct TargetEntry {
     balance_str: String,
 }
 
-fn load_targets(address_input: &str) -> Vec<TargetEntry> {
+fn load_targets_raw(address_input: &str) -> Vec<TargetEntry> {
     let path = Path::new(address_input);
     if path.exists() && path.is_file() {
         let content = fs::read_to_string(path).unwrap_or_else(|e| {
@@ -82,7 +82,7 @@ fn load_targets(address_input: &str) -> Vec<TargetEntry> {
             std::process::exit(1);
         }
 
-        println!("Loaded {} target address(es) from TSV file '{}'. Loading into GPU memory...", entries.len(), address_input);
+        println!("Loaded {} target address(es) from TSV file '{}'. Sorting for GPU O(log N) Binary Search...", entries.len(), address_input);
         entries
     } else {
         // Single Base58 Address string
@@ -108,6 +108,30 @@ fn load_targets(address_input: &str) -> Vec<TargetEntry> {
             }
         }
     }
+}
+
+fn load_targets(address_input: &str) -> (Vec<u64>, Vec<u8>, u32, Vec<TargetEntry>) {
+    let raw_entries = load_targets_raw(address_input);
+
+    let mut sorted_entries = raw_entries;
+    sorted_entries.sort_by_key(|e| {
+        let mut prefix_bytes = [0u8; 8];
+        prefix_bytes.copy_from_slice(&e.address_bytes[1..9]);
+        u64::from_be_bytes(prefix_bytes)
+    });
+
+    let mut target_prefixes = Vec::with_capacity(sorted_entries.len());
+    let mut flat_target_bytes = Vec::with_capacity(sorted_entries.len() * 25);
+
+    for e in &sorted_entries {
+        let mut prefix_bytes = [0u8; 8];
+        prefix_bytes.copy_from_slice(&e.address_bytes[1..9]);
+        target_prefixes.push(u64::from_be_bytes(prefix_bytes));
+        flat_target_bytes.extend_from_slice(&e.address_bytes);
+    }
+
+    let num_targets = sorted_entries.len() as u32;
+    (target_prefixes, flat_target_bytes, num_targets, sorted_entries)
 }
 
 fn get_random_u64() -> u64 {
@@ -314,25 +338,22 @@ fn main() {
 
     // CASE A: --file auto AND custom --address (.txt / .tsv) -> GPU RANDOM SEED SCANNER MODE
     if is_auto_file && !is_auto_address {
-        let targets = load_targets(&args.address);
-        let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
-        for t in &targets {
-            flat_target_bytes.extend_from_slice(&t.address_bytes);
-        }
-        let num_targets = targets.len() as u32;
+        let (target_prefixes, flat_target_bytes, num_targets, _entries) = load_targets(&args.address);
 
-        println!("\n🚀 STARTING GPU RANDOM SEED SCANNER MODE");
-        println!("Target File/Address: '{}' ({} target address(es) loaded into GPU memory)", args.address, num_targets);
+        println!("\n🚀 STARTING GPU RANDOM SEED SCANNER MODE (O(log N) GPU Binary Search)");
+        println!("Target File/Address: '{}' ({} target address(es) sorted & loaded into GPU memory)", args.address, num_targets);
         println!("Batch Size: {} seeds per GPU execution batch\n", args.batch_size);
 
         let batch_size = args.batch_size;
         let flat_bytes = flat_target_bytes.clone();
+        let prefixes = target_prefixes.clone();
 
         device_ids.into_par_iter().for_each(move |device_id| {
             if let Err(e) = run_gpu_random_scanner(
                 platform_id,
                 device_id,
                 src_cstring.clone(),
+                &prefixes,
                 &flat_bytes,
                 num_targets,
                 batch_size,
@@ -396,16 +417,11 @@ fn main() {
     println!("Input Words (12): {:?}", word_refs);
 
     // 2. Load Target Addresses
-    let targets = load_targets(&args.address);
-
-    let mut flat_target_bytes = Vec::with_capacity(targets.len() * 25);
-    for t in &targets {
-        flat_target_bytes.extend_from_slice(&t.address_bytes);
-    }
-    let num_targets = targets.len() as u32;
+    let (target_prefixes, flat_target_bytes, num_targets, _entries) = load_targets(&args.address);
 
     let has_wildcards = word_refs.iter().any(|&w| w == "?" || w == "*" || w == "x");
     let flat_bytes = flat_target_bytes.clone();
+    let prefixes = target_prefixes.clone();
 
     if !has_wildcards {
         // MODE 1: PERMUTATION MODE (12 known words, unordered)
@@ -425,6 +441,7 @@ fn main() {
                 device_id,
                 src_cstring.clone(),
                 kernel_name,
+                &prefixes,
                 &flat_bytes,
                 num_targets,
                 &hi_list,
@@ -489,6 +506,7 @@ fn main() {
                 device_id,
                 src_cstring.clone(),
                 kernel_name,
+                &prefixes,
                 &flat_bytes,
                 num_targets,
                 start_entropy,
@@ -505,6 +523,7 @@ fn run_gpu_random_scanner(
     platform_id: core::types::abs::PlatformId,
     device_id: core::types::abs::DeviceId,
     src: CString,
+    target_prefixes: &[u64],
     flat_target_bytes: &[u8],
     num_targets: u32,
     batch_size: u64,
@@ -514,6 +533,15 @@ fn run_gpu_random_scanner(
     let program = core::create_program_with_source(&context, &[src])?;
     core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let target_prefixes_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            target_prefixes.len(),
+            Some(target_prefixes),
+        )?
+    };
 
     let target_addresses_buf = unsafe {
         core::create_buffer(
@@ -561,7 +589,6 @@ fn run_gpu_random_scanner(
         let start_hi: cl_ulong = random_hi;
         let start_lo: cl_ulong = random_lo;
 
-        // Reset found flag
         mnemonic_found[0] = 0;
         unsafe {
             core::enqueue_write_buffer(
@@ -577,10 +604,11 @@ fn run_gpu_random_scanner(
 
         core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&start_hi))?;
         core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&start_lo))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_prefixes_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 6, ArgVal::mem(&mnemonic_found_buf))?;
 
         unsafe {
             core::enqueue_kernel(
@@ -816,6 +844,7 @@ fn mnemonic_gpu_perm(
     device_id: core::types::abs::DeviceId,
     src: CString,
     kernel_name: &str,
+    target_prefixes: &[u64],
     flat_target_bytes: &[u8],
     num_targets: u32,
     hi_list: &[u64],
@@ -827,6 +856,15 @@ fn mnemonic_gpu_perm(
     let program = core::create_program_with_source(&context, &[src])?;
     core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let target_prefixes_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            target_prefixes.len(),
+            Some(target_prefixes),
+        )?
+    };
 
     let target_addresses_buf = unsafe {
         core::create_buffer(
@@ -896,10 +934,11 @@ fn mnemonic_gpu_perm(
 
         core::set_kernel_arg(&kernel, 0, ArgVal::mem(&hi_buf))?;
         core::set_kernel_arg(&kernel, 1, ArgVal::mem(&lo_buf))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_prefixes_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 6, ArgVal::mem(&mnemonic_found_buf))?;
 
         unsafe {
             core::enqueue_kernel(
@@ -963,6 +1002,7 @@ fn mnemonic_gpu_range(
     device_id: core::types::abs::DeviceId,
     src: CString,
     kernel_name: &str,
+    target_prefixes: &[u64],
     flat_target_bytes: &[u8],
     num_targets: u32,
     start_entropy: u128,
@@ -974,6 +1014,15 @@ fn mnemonic_gpu_range(
     let program = core::create_program_with_source(&context, &[src])?;
     core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let target_prefixes_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            target_prefixes.len(),
+            Some(target_prefixes),
+        )?
+    };
 
     let target_addresses_buf = unsafe {
         core::create_buffer(
@@ -1026,10 +1075,11 @@ fn mnemonic_gpu_range(
 
         core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&start_hi))?;
         core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&start_lo))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_addresses_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_targets))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&mnemonic_found_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_prefixes_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 6, ArgVal::mem(&mnemonic_found_buf))?;
 
         unsafe {
             core::enqueue_kernel(

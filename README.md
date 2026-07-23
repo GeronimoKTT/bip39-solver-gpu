@@ -2,13 +2,23 @@
 
 A modernized, high-performance GPU-accelerated BIP39 mnemonic solver & random seed scanner for Bitcoin P2SH-P2WPKH addresses.
 
+## High-Performance Optimizations
+
+### 🚀 $O(\log N)$ GPU 64-bit Binary Search for Huge TSV Files
+For large TSV target files containing thousands or millions of addresses:
+- Target addresses are sorted on the host by their 64-bit HASH160 prefix before uploading to GPU.
+- GPU OpenCL kernels perform a **64-bit Binary Search** ($O(\log N)$) instead of linear search ($O(N)$).
+- **Speedup**: Searching 1,000,000 target addresses takes only ~20 GPU clock comparisons per candidate seed instead of 1,000,000 loop iterations (over **50,000x faster matching** for huge TSV files).
+
+---
+
 ## Features & Modes
 
 ### 1. GPU Random Seed Scanner Mode (`--file auto --address <tsv/txt>`)
 When passing `--file auto` together with an address file (`--address sample_addresses.tsv` or `.txt`), the tool launches **GPU Random Seed Scanner Mode**:
-- Loads all target addresses into GPU memory (`target_addresses` buffer).
+- Loads all target addresses into GPU memory (`target_prefixes` and `target_addresses` buffers).
 - Continuously auto-generates random valid BIP39 12-word seeds in batches (e.g. 10,000,000 per GPU execution batch).
-- Derives P2SH Bitcoin addresses directly on GPU CUDA cores and compares each against all target addresses loaded in GPU memory.
+- Derives P2SH Bitcoin addresses directly on GPU CUDA cores and matches each against all target addresses using $O(\log N)$ GPU binary search.
 - When any generated seed matches any address in your file, it outputs the winning mnemonic and exits!
 
 ### 2. Single-Seed Auto Test Mode (`--file auto`)
