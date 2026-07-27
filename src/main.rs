@@ -1520,7 +1520,7 @@ fn mnemonic_gpu_unordered_wildcard(
     platform_id: core::types::abs::PlatformId,
     device_id: core::types::abs::DeviceId,
     src: CString,
-    kernel_name: &str,
+    _kernel_name: &str,
     target_prefixes: &[u64],
     flat_target_bytes: &[u8],
     num_targets: u32,
@@ -1583,6 +1583,34 @@ fn mnemonic_gpu_unordered_wildcard(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_position(0);
 
+    let max_valid_per_batch = (batch_size / 10) as usize;
+    let valid_hi_buf = unsafe {
+        core::create_buffer::<_, u64>(
+            &context,
+            flags::MEM_READ_WRITE,
+            max_valid_per_batch,
+            None,
+        )?
+    };
+
+    let valid_lo_buf = unsafe {
+        core::create_buffer::<_, u64>(
+            &context,
+            flags::MEM_READ_WRITE,
+            max_valid_per_batch,
+            None,
+        )?
+    };
+
+    let valid_count_buf = unsafe {
+        core::create_buffer::<_, u32>(
+            &context,
+            flags::MEM_READ_WRITE,
+            1,
+            None,
+        )?
+    };
+
     let mut current_offset: u128 = 0;
     let max_offset = total_space;
 
@@ -1592,44 +1620,33 @@ fn mnemonic_gpu_unordered_wildcard(
         let current_batch = std::cmp::min(batch_size, (max_offset - current_offset) as u64);
         let combination_offset: cl_ulong = current_offset as u64;
 
-        let mut target_mnemonic = vec![0u8; 120];
-        let mut mnemonic_found = vec![0u8; 1];
+        let zero_count = [0u32; 1];
+        unsafe {
+            core::enqueue_write_buffer(
+                &queue,
+                &valid_count_buf,
+                true,
+                0,
+                &zero_count,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
 
-        let target_mnemonic_buf = unsafe {
-            core::create_buffer(
-                &context,
-                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
-                120,
-                Some(&target_mnemonic),
-            )?
-        };
-
-        let mnemonic_found_buf = unsafe {
-            core::create_buffer(
-                &context,
-                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
-                1,
-                Some(&mnemonic_found),
-            )?
-        };
-
-        let kernel = core::create_kernel(&program, kernel_name)?;
-
-        core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&combination_offset))?;
-        core::set_kernel_arg(&kernel, 1, ArgVal::mem(&unique_elements_buf))?;
-        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&original_counts_buf))?;
-        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_unique))?;
-        core::set_kernel_arg(&kernel, 4, ArgVal::scalar(&num_wildcards))?;
-        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&target_prefixes_buf))?;
-        core::set_kernel_arg(&kernel, 6, ArgVal::mem(&target_addresses_buf))?;
-        core::set_kernel_arg(&kernel, 7, ArgVal::scalar(&num_targets))?;
-        core::set_kernel_arg(&kernel, 8, ArgVal::mem(&target_mnemonic_buf))?;
-        core::set_kernel_arg(&kernel, 9, ArgVal::mem(&mnemonic_found_buf))?;
+        let filter_kernel = core::create_kernel(&program, "filter_unordered_wildcard_checksum")?;
+        core::set_kernel_arg(&filter_kernel, 0, ArgVal::scalar(&combination_offset))?;
+        core::set_kernel_arg(&filter_kernel, 1, ArgVal::mem(&unique_elements_buf))?;
+        core::set_kernel_arg(&filter_kernel, 2, ArgVal::mem(&original_counts_buf))?;
+        core::set_kernel_arg(&filter_kernel, 3, ArgVal::scalar(&num_unique))?;
+        core::set_kernel_arg(&filter_kernel, 4, ArgVal::scalar(&num_wildcards))?;
+        core::set_kernel_arg(&filter_kernel, 5, ArgVal::mem(&valid_hi_buf))?;
+        core::set_kernel_arg(&filter_kernel, 6, ArgVal::mem(&valid_lo_buf))?;
+        core::set_kernel_arg(&filter_kernel, 7, ArgVal::mem(&valid_count_buf))?;
 
         unsafe {
             core::enqueue_kernel(
                 &queue,
-                &kernel,
+                &filter_kernel,
                 1,
                 None,
                 &[current_batch as usize, 1, 1],
@@ -1639,43 +1656,102 @@ fn mnemonic_gpu_unordered_wildcard(
             )?;
         }
 
+        let mut valid_count_host = [0u32; 1];
         unsafe {
             core::enqueue_read_buffer(
                 &queue,
-                &target_mnemonic_buf,
+                &valid_count_buf,
                 true,
                 0,
-                &mut target_mnemonic,
+                &mut valid_count_host,
                 None::<core::Event>,
                 None::<&mut core::Event>,
             )?;
         }
 
-        unsafe {
-            core::enqueue_read_buffer(
-                &queue,
-                &mnemonic_found_buf,
-                true,
-                0,
-                &mut mnemonic_found,
-                None::<core::Event>,
-                None::<&mut core::Event>,
-            )?;
+        let num_valid = valid_count_host[0] as usize;
+
+        if num_valid > 0 {
+            let mut target_mnemonic = vec![0u8; 120];
+            let mut mnemonic_found = vec![0u8; 1];
+
+            let target_mnemonic_buf = unsafe {
+                core::create_buffer(
+                    &context,
+                    flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                    120,
+                    Some(&target_mnemonic),
+                )?
+            };
+
+            let mnemonic_found_buf = unsafe {
+                core::create_buffer(
+                    &context,
+                    flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                    1,
+                    Some(&mnemonic_found),
+                )?
+            };
+
+            let perm_kernel = core::create_kernel(&program, "int_to_address_perm")?;
+            core::set_kernel_arg(&perm_kernel, 0, ArgVal::mem(&valid_hi_buf))?;
+            core::set_kernel_arg(&perm_kernel, 1, ArgVal::mem(&valid_lo_buf))?;
+            core::set_kernel_arg(&perm_kernel, 2, ArgVal::mem(&target_prefixes_buf))?;
+            core::set_kernel_arg(&perm_kernel, 3, ArgVal::mem(&target_addresses_buf))?;
+            core::set_kernel_arg(&perm_kernel, 4, ArgVal::scalar(&num_targets))?;
+            core::set_kernel_arg(&perm_kernel, 5, ArgVal::mem(&target_mnemonic_buf))?;
+            core::set_kernel_arg(&perm_kernel, 6, ArgVal::mem(&mnemonic_found_buf))?;
+
+            unsafe {
+                core::enqueue_kernel(
+                    &queue,
+                    &perm_kernel,
+                    1,
+                    None,
+                    &[num_valid, 1, 1],
+                    None,
+                    None::<core::Event>,
+                    None::<&mut core::Event>,
+                )?;
+            }
+
+            unsafe {
+                core::enqueue_read_buffer(
+                    &queue,
+                    &mnemonic_found_buf,
+                    true,
+                    0,
+                    &mut mnemonic_found,
+                    None::<core::Event>,
+                    None::<&mut core::Event>,
+                )?;
+            }
+
+            if mnemonic_found[0] == 0x01 {
+                unsafe {
+                    core::enqueue_read_buffer(
+                        &queue,
+                        &target_mnemonic_buf,
+                        true,
+                        0,
+                        &mut target_mnemonic,
+                        None::<core::Event>,
+                        None::<&mut core::Event>,
+                    )?;
+                }
+
+                pb.finish_with_message("MATCH FOUND!");
+                let s = String::from_utf8_lossy(&target_mnemonic).to_string();
+                let mnemonic = s.trim_matches(char::from(0));
+                println!("\n========================================");
+                println!("🎉 MNEMONIC MATCH FOUND!");
+                println!("Mnemonic: {}", mnemonic);
+                println!("========================================\n");
+                std::process::exit(0);
+            }
         }
 
         pb.inc(current_batch);
-
-        if mnemonic_found[0] == 0x01 {
-            pb.finish_with_message("MATCH FOUND!");
-            let s = String::from_utf8_lossy(&target_mnemonic).to_string();
-            let mnemonic = s.trim_matches(char::from(0));
-            println!("\n========================================");
-            println!("🎉 MNEMONIC MATCH FOUND!");
-            println!("Mnemonic: {}", mnemonic);
-            println!("========================================\n");
-            std::process::exit(0);
-        }
-
         current_offset += current_batch as u128;
     }
 

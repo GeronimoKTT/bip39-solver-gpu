@@ -631,3 +631,89 @@ __kernel void int_to_address_unordered_wildcard(
     }
 }
 
+__kernel void filter_unordered_wildcard_checksum(
+    ulong combination_offset,
+    __global const ushort * unique_elements,
+    __global const uchar * original_counts,
+    uchar num_unique,
+    uint num_wildcards,
+    __global ulong * valid_hi_list,
+    __global ulong * valid_lo_list,
+    __global uint * valid_count
+) {
+    ulong idx = get_global_id(0);
+    ulong combination_idx = combination_offset + idx;
+
+    ushort local_unique[12];
+    uchar local_counts[12];
+    for (uchar u = 0; u < num_unique; u++) {
+        local_unique[u] = unique_elements[u];
+        local_counts[u] = original_counts[u];
+    }
+
+    ulong num_wildcard_combos = 1UL;
+    for (uint w = 0; w < num_wildcards; w++) {
+        num_wildcard_combos *= 2048UL;
+    }
+
+    ulong perm_rank = combination_idx / num_wildcard_combos;
+    ulong wildcard_composite = combination_idx % num_wildcard_combos;
+
+    ushort indices[12];
+    unrank_multiset_perm_gpu(perm_rank, local_unique, local_counts, num_unique, indices);
+
+    ulong w_temp = wildcard_composite;
+    for (uchar i = 0; i < 12; i++) {
+        if (indices[i] == 0xFFFF) {
+            indices[i] = (ushort)(w_temp % 2048UL);
+            w_temp /= 2048UL;
+        }
+    }
+
+    ulong mnemonic_hi = ((ulong)indices[0] << 53) |
+                        ((ulong)indices[1] << 42) |
+                        ((ulong)indices[2] << 31) |
+                        ((ulong)indices[3] << 20) |
+                        ((ulong)indices[4] << 9)  |
+                        ((ulong)indices[5] >> 2);
+
+    ulong mnemonic_lo = (((ulong)indices[5] & 3UL) << 62) |
+                        ((ulong)indices[6] << 51) |
+                        ((ulong)indices[7] << 40) |
+                        ((ulong)indices[8] << 29) |
+                        ((ulong)indices[9] << 18) |
+                        ((ulong)indices[10] << 7) |
+                        ((ulong)indices[11] >> 4);
+
+    uchar bytes[16];
+    bytes[15] = mnemonic_lo & 0xFF;
+    bytes[14] = (mnemonic_lo >> 8) & 0xFF;
+    bytes[13] = (mnemonic_lo >> 16) & 0xFF;
+    bytes[12] = (mnemonic_lo >> 24) & 0xFF;
+    bytes[11] = (mnemonic_lo >> 32) & 0xFF;
+    bytes[10] = (mnemonic_lo >> 40) & 0xFF;
+    bytes[9] = (mnemonic_lo >> 48) & 0xFF;
+    bytes[8] = (mnemonic_lo >> 56) & 0xFF;
+
+    bytes[7] = mnemonic_hi & 0xFF;
+    bytes[6] = (mnemonic_hi >> 8) & 0xFF;
+    bytes[5] = (mnemonic_hi >> 16) & 0xFF;
+    bytes[4] = (mnemonic_hi >> 24) & 0xFF;
+    bytes[3] = (mnemonic_hi >> 32) & 0xFF;
+    bytes[2] = (mnemonic_hi >> 40) & 0xFF;
+    bytes[1] = (mnemonic_hi >> 48) & 0xFF;
+    bytes[0] = (mnemonic_hi >> 56) & 0xFF;
+
+    uchar mnemonic_hash[32];
+    sha256(&bytes, 16, &mnemonic_hash);
+    uchar expected_checksum = (mnemonic_hash[0] >> 4) & 0x0F;
+    uchar actual_checksum = (uchar)(indices[11] & 0x0F);
+
+    if (expected_checksum == actual_checksum) {
+        uint pos = atomic_inc(valid_count);
+        valid_hi_list[pos] = mnemonic_hi;
+        valid_lo_list[pos] = mnemonic_lo;
+    }
+}
+
+
