@@ -1621,7 +1621,8 @@ fn mnemonic_gpu_unordered_wildcard(
     let num_unique = unique_elements.len() as u8;
 
     while current_offset < max_offset {
-        let current_batch = std::cmp::min(batch_size, (max_offset - current_offset) as u64);
+        let raw_batch = std::cmp::min(batch_size, (max_offset - current_offset) as u64);
+        let current_batch = ((raw_batch + 255) / 256) * 256;
         let combination_offset: cl_ulong = current_offset as u64;
 
         let zero_count = [0u32; 1];
