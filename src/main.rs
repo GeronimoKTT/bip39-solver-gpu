@@ -487,7 +487,7 @@ fn main() {
         println!("Expected valid BIP39 checksum combinations: ~{}", format_u128_with_commas(expected_valid));
         println!("CPU prep time: 0.00s (Dispatching directly to GPU)\n");
 
-        let batch_size = args.batch_size;
+        let batch_size = if args.batch_size == 100_000_000 { 10_000_000 } else { args.batch_size };
         let kernel_name = "int_to_address_unordered_wildcard";
 
         device_ids.into_par_iter().for_each(move |device_id| {
