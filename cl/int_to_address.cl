@@ -406,14 +406,14 @@ inline ulong count_multiset_perms_gpu(const uchar counts[], uchar num_unique, uc
 
 inline void unrank_multiset_perm_gpu(
     ulong perm_rank,
-    __global const ushort * unique_elements,
-    __global const uchar * original_counts,
+    const ushort local_unique[12],
+    const uchar local_counts[12],
     uchar num_unique,
     ushort out_indices[12]
 ) {
     uchar counts[12];
     for (uchar i = 0; i < num_unique; i++) {
-        counts[i] = original_counts[i];
+        counts[i] = local_counts[i];
     }
 
     for (uchar slot = 0; slot < 12; slot++) {
@@ -424,7 +424,7 @@ inline void unrank_multiset_perm_gpu(
             counts[u]--;
             ulong S = count_multiset_perms_gpu(counts, num_unique, remaining_len);
             if (perm_rank < S) {
-                out_indices[slot] = unique_elements[u];
+                out_indices[slot] = local_unique[u];
                 break;
             } else {
                 perm_rank -= S;
@@ -449,6 +449,13 @@ __kernel void int_to_address_unordered_wildcard(
     ulong idx = get_global_id(0);
     ulong combination_idx = combination_offset + idx;
 
+    ushort local_unique[12];
+    uchar local_counts[12];
+    for (uchar u = 0; u < num_unique; u++) {
+        local_unique[u] = unique_elements[u];
+        local_counts[u] = original_counts[u];
+    }
+
     ulong num_wildcard_combos = 1UL;
     for (uint w = 0; w < num_wildcards; w++) {
         num_wildcard_combos *= 2048UL;
@@ -458,7 +465,7 @@ __kernel void int_to_address_unordered_wildcard(
     ulong wildcard_composite = combination_idx % num_wildcard_combos;
 
     ushort indices[12];
-    unrank_multiset_perm_gpu(perm_rank, unique_elements, original_counts, num_unique, indices);
+    unrank_multiset_perm_gpu(perm_rank, local_unique, local_counts, num_unique, indices);
 
     ulong w_temp = wildcard_composite;
     for (uchar i = 0; i < 12; i++) {
