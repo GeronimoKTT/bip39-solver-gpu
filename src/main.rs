@@ -1573,7 +1573,8 @@ fn mnemonic_gpu_unordered_wildcard(
         )?
     };
 
-    let pb = ProgressBar::new(if total_space > u64::MAX as u128 { u64::MAX } else { total_space as u64 });
+    let expected_valid = (total_space / 16) as u64;
+    let pb = ProgressBar::new(expected_valid);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[GPU Unordered Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
@@ -1652,7 +1653,7 @@ fn mnemonic_gpu_unordered_wildcard(
                 1,
                 None,
                 &[current_batch as usize, 1, 1],
-                None,
+                Some([256, 1, 1]),
                 None::<core::Event>,
                 None::<&mut core::Event>,
             )?;
@@ -1752,7 +1753,7 @@ fn mnemonic_gpu_unordered_wildcard(
             }
         }
 
-        pb.inc(current_batch);
+        pb.inc(num_valid as u64);
         current_offset += current_batch as u128;
     }
 

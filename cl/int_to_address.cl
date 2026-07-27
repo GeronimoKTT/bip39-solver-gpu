@@ -710,10 +710,31 @@ __kernel void filter_unordered_wildcard_checksum(
     uchar expected_checksum = (mnemonic_hash[0] >> 4) & 0x0F;
     uchar actual_checksum = (uchar)(indices[11] & 0x0F);
 
-    if (expected_checksum == actual_checksum) {
-        uint pos = atomic_inc(valid_count);
-        valid_hi_list[pos] = mnemonic_hi;
-        valid_lo_list[pos] = mnemonic_lo;
+    bool is_valid = (expected_checksum == actual_checksum);
+
+    __local uint local_valid_count;
+    __local uint local_base_index;
+
+    if (get_local_id(0) == 0) {
+        local_valid_count = 0;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    uint my_local_idx = 0;
+    if (is_valid) {
+        my_local_idx = atomic_inc(&local_valid_count);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (get_local_id(0) == 0 && local_valid_count > 0) {
+        local_base_index = atomic_add(valid_count, local_valid_count);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (is_valid) {
+        uint global_pos = local_base_index + my_local_idx;
+        valid_hi_list[global_pos] = mnemonic_hi;
+        valid_lo_list[global_pos] = mnemonic_lo;
     }
 }
 
