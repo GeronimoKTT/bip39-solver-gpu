@@ -442,7 +442,7 @@ fn main() {
 
     if args.unordered_wildcard {
         let mut known_indices = Vec::new();
-        let mut _wildcard_count = 0;
+        let mut _wildcard_count = 0u32;
 
         for word in &words {
             let w_lower = word.to_lowercase();
@@ -461,13 +461,37 @@ fn main() {
             std::process::exit(1);
         }
 
-        let candidate_pairs = generate_unordered_wildcard_candidates_parallel(&known_indices);
-        let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
+        let k = known_indices.len();
+        let w = (12 - k) as u32;
+
+        let mut template = vec![0xFFFFu16; w as usize];
+        template.extend_from_slice(&known_indices);
+        template.sort_unstable();
+
+        let mut counts_map = std::collections::BTreeMap::new();
+        for &val in &template {
+            *counts_map.entry(val).or_insert(0u8) += 1;
+        }
+
+        let unique_elements: Vec<u16> = counts_map.keys().cloned().collect();
+        let original_counts: Vec<u8> = counts_map.values().cloned().collect();
+
+        let p_unique = compute_unique_placements_and_perms(&known_indices, 12);
+        let total_raw: u128 = p_unique * (2048_u128.pow(w));
+        let expected_valid: u128 = total_raw / 16;
+
+        println!("\n=== Running Mode: UNORDERED WILDCARD MODE (GPU DIRECT) ===");
+        println!("Loaded {} known word(s) and {} wildcard slot(s).", k, w);
+        println!("Unique placement permutations (P_unique): {}", format_u128_with_commas(p_unique));
+        println!("Total raw combinations: {}", format_u128_with_commas(total_raw));
+        println!("Expected valid BIP39 checksum combinations: ~{}", format_u128_with_commas(expected_valid));
+        println!("CPU prep time: 0.00s (Dispatching directly to GPU)\n");
+
         let batch_size = args.batch_size;
-        let kernel_name = "int_to_address_perm";
+        let kernel_name = "int_to_address_unordered_wildcard";
 
         device_ids.into_par_iter().for_each(move |device_id| {
-            if let Err(e) = mnemonic_gpu_perm(
+            if let Err(e) = mnemonic_gpu_unordered_wildcard(
                 platform_id,
                 device_id,
                 src_cstring.clone(),
@@ -475,8 +499,10 @@ fn main() {
                 &prefixes,
                 &flat_bytes,
                 num_targets,
-                &hi_list,
-                &lo_list,
+                &unique_elements,
+                &original_counts,
+                w,
+                total_raw,
                 batch_size,
             ) {
                 eprintln!("GPU Execution Error: {}", e);
@@ -922,6 +948,7 @@ fn compute_unique_placements_and_perms(known_indices: &[u16], total_len: usize) 
     num / den
 }
 
+#[allow(dead_code)]
 fn expand_wildcards_and_collect(
     perm: &[u16; 12],
     wildcard_indices: &[usize],
@@ -1079,6 +1106,7 @@ fn expand_wildcards_and_collect(
     expand_recursive(0, &mut current_perm, wildcard_indices, local_candidates);
 }
 
+#[allow(dead_code)]
 fn generate_unordered_wildcard_candidates_parallel(known_indices: &[u16]) -> Vec<(u64, u64)> {
     let total_len = 12;
     let k = known_indices.len();
@@ -1487,6 +1515,171 @@ fn mnemonic_gpu_range(
     pb.finish_with_message("GPU Range Search complete.");
     Ok(())
 }
+
+fn mnemonic_gpu_unordered_wildcard(
+    platform_id: core::types::abs::PlatformId,
+    device_id: core::types::abs::DeviceId,
+    src: CString,
+    kernel_name: &str,
+    target_prefixes: &[u64],
+    flat_target_bytes: &[u8],
+    num_targets: u32,
+    unique_elements: &[u16],
+    original_counts: &[u8],
+    num_wildcards: u32,
+    total_space: u128,
+    batch_size: u64,
+) -> ocl::core::Result<()> {
+    let context_properties = ContextProperties::new().platform(platform_id);
+    let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
+    let program = core::create_program_with_source(&context, &[src])?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    let queue = core::create_command_queue(&context, &device_id, None)?;
+
+    let unique_elements_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            unique_elements.len(),
+            Some(unique_elements),
+        )?
+    };
+
+    let original_counts_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            original_counts.len(),
+            Some(original_counts),
+        )?
+    };
+
+    let target_prefixes_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            target_prefixes.len(),
+            Some(target_prefixes),
+        )?
+    };
+
+    let target_addresses_buf = unsafe {
+        core::create_buffer(
+            &context,
+            flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR,
+            flat_target_bytes.len(),
+            Some(flat_target_bytes),
+        )?
+    };
+
+    let pb = ProgressBar::new(if total_space > u64::MAX as u128 { u64::MAX } else { total_space as u64 });
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[GPU Unordered Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let mut current_offset: u128 = 0;
+    let max_offset = total_space;
+
+    let num_unique = unique_elements.len() as u8;
+
+    while current_offset < max_offset {
+        let current_batch = std::cmp::min(batch_size, (max_offset - current_offset) as u64);
+        let combination_offset: cl_ulong = current_offset as u64;
+
+        let mut target_mnemonic = vec![0u8; 120];
+        let mut mnemonic_found = vec![0u8; 1];
+
+        let target_mnemonic_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                120,
+                Some(&target_mnemonic),
+            )?
+        };
+
+        let mnemonic_found_buf = unsafe {
+            core::create_buffer(
+                &context,
+                flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                1,
+                Some(&mnemonic_found),
+            )?
+        };
+
+        let kernel = core::create_kernel(&program, kernel_name)?;
+
+        core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&combination_offset))?;
+        core::set_kernel_arg(&kernel, 1, ArgVal::mem(&unique_elements_buf))?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&original_counts_buf))?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&num_unique))?;
+        core::set_kernel_arg(&kernel, 4, ArgVal::scalar(&num_wildcards))?;
+        core::set_kernel_arg(&kernel, 5, ArgVal::mem(&target_prefixes_buf))?;
+        core::set_kernel_arg(&kernel, 6, ArgVal::mem(&target_addresses_buf))?;
+        core::set_kernel_arg(&kernel, 7, ArgVal::scalar(&num_targets))?;
+        core::set_kernel_arg(&kernel, 8, ArgVal::mem(&target_mnemonic_buf))?;
+        core::set_kernel_arg(&kernel, 9, ArgVal::mem(&mnemonic_found_buf))?;
+
+        unsafe {
+            core::enqueue_kernel(
+                &queue,
+                &kernel,
+                1,
+                None,
+                &[current_batch as usize, 1, 1],
+                None,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        unsafe {
+            core::enqueue_read_buffer(
+                &queue,
+                &target_mnemonic_buf,
+                true,
+                0,
+                &mut target_mnemonic,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        unsafe {
+            core::enqueue_read_buffer(
+                &queue,
+                &mnemonic_found_buf,
+                true,
+                0,
+                &mut mnemonic_found,
+                None::<core::Event>,
+                None::<&mut core::Event>,
+            )?;
+        }
+
+        pb.inc(current_batch);
+
+        if mnemonic_found[0] == 0x01 {
+            pb.finish_with_message("MATCH FOUND!");
+            let s = String::from_utf8_lossy(&target_mnemonic).to_string();
+            let mnemonic = s.trim_matches(char::from(0));
+            println!("\n========================================");
+            println!("🎉 MNEMONIC MATCH FOUND!");
+            println!("Mnemonic: {}", mnemonic);
+            println!("========================================\n");
+            std::process::exit(0);
+        }
+
+        current_offset += current_batch as u128;
+    }
+
+    pb.finish_with_message("GPU Unordered Search complete.");
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
