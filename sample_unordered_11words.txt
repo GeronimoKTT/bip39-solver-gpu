@@ -1,0 +1,16 @@
+# Sample 11/12 Unordered Known Words + 1 Wildcard Test Vector
+# Target Address: 3Co6PmCofnGXHwPR946YTXqJxCoL1TQXHb
+# Secret Seed: absurd avoid scissors anxiety gather lottery category door army half long camera
+
+lottery
+absurd
+anxiety
+half
+scissors
+gather
+avoid
+army
+long
+category
+door
+?

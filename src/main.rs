@@ -33,6 +33,10 @@ struct Args {
     /// Batch size per GPU kernel execution
     #[arg(short, long, default_value_t = 100_000_000)]
     batch_size: u64,
+
+    /// Enable unordered wildcard mode where known words in the file can be in any position along with wildcards (?, *, x)
+    #[arg(long, alias = "unordered_wildcard", default_value_t = false)]
+    unordered_wildcard: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -436,7 +440,49 @@ fn main() {
     let flat_bytes = flat_target_bytes.clone();
     let prefixes = target_prefixes.clone();
 
-    if !has_wildcards {
+    if args.unordered_wildcard {
+        let mut known_indices = Vec::new();
+        let mut _wildcard_count = 0;
+
+        for word in &words {
+            let w_lower = word.to_lowercase();
+            if w_lower == "?" || w_lower == "*" || w_lower == "x" || w_lower == "_" {
+                _wildcard_count += 1;
+            } else if let Some(idx) = bip39::get_word_index(word) {
+                known_indices.push(idx as u16);
+            } else {
+                eprintln!("Warning: Unrecognized word '{}' treated as wildcard", word);
+                _wildcard_count += 1;
+            }
+        }
+
+        if known_indices.len() > 12 {
+            eprintln!("Error: File contains {} known words (maximum is 12)", known_indices.len());
+            std::process::exit(1);
+        }
+
+        let candidate_pairs = generate_unordered_wildcard_candidates_parallel(&known_indices);
+        let (hi_list, lo_list): (Vec<u64>, Vec<u64>) = candidate_pairs.into_iter().unzip();
+        let batch_size = args.batch_size;
+        let kernel_name = "int_to_address_perm";
+
+        device_ids.into_par_iter().for_each(move |device_id| {
+            if let Err(e) = mnemonic_gpu_perm(
+                platform_id,
+                device_id,
+                src_cstring.clone(),
+                kernel_name,
+                &prefixes,
+                &flat_bytes,
+                num_targets,
+                &hi_list,
+                &lo_list,
+                batch_size,
+            ) {
+                eprintln!("GPU Execution Error: {}", e);
+            }
+        });
+    } else if !has_wildcards {
         // MODE 1: PERMUTATION MODE (12 known words, unordered)
         println!("\n=== Running Mode: PERMUTATION MODE ===");
         println!("Generating and filtering permutations in parallel across CPU cores...");
@@ -835,6 +881,294 @@ fn generate_permutation_candidates_parallel(words: &[&str]) -> Vec<(u64, u64)> {
     candidate_chunks.into_iter().flatten().collect()
 }
 
+fn format_u128_with_commas(n: u128) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    let len = s.len();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn compute_unique_placements_and_perms(known_indices: &[u16], total_len: usize) -> u128 {
+    let k = known_indices.len();
+    if k > total_len {
+        return 0;
+    }
+    let w = total_len - k;
+
+    let mut counts = std::collections::HashMap::new();
+    for &idx in known_indices {
+        *counts.entry(idx).or_insert(0u32) += 1;
+    }
+    counts.insert(0xFFFF, w as u32);
+
+    let mut num: u128 = 1;
+    for i in 1..=(total_len as u128) {
+        num *= i;
+    }
+
+    let mut den: u128 = 1;
+    for (&_val, &count) in counts.iter() {
+        for c in 1..=(count as u128) {
+            den *= c;
+        }
+    }
+
+    num / den
+}
+
+fn expand_wildcards_and_collect(
+    perm: &[u16; 12],
+    wildcard_indices: &[usize],
+    local_candidates: &mut Vec<(u64, u64)>,
+) {
+    let w_count = wildcard_indices.len();
+    if w_count == 0 {
+        let mut entropy_128: u128 = 0;
+        for i in 0..11 {
+            let shift = 117 - i * 11;
+            entropy_128 |= (perm[i] as u128) << shift;
+        }
+        entropy_128 |= (perm[11] >> 4) as u128;
+
+        let bytes = entropy_128.to_be_bytes();
+        let sha_res = simple_sha256(&bytes);
+        let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+        let actual_checksum = (perm[11] & 0x0F) as u8;
+
+        if expected_checksum == actual_checksum {
+            let hi = (entropy_128 >> 64) as u64;
+            let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+            local_candidates.push((hi, lo));
+        }
+        return;
+    }
+
+    if w_count == 1 {
+        let p0 = wildcard_indices[0];
+        let mut current_perm = *perm;
+        if p0 == 11 {
+            let mut top_bits_entropy: u128 = 0;
+            for i in 0..11 {
+                let shift = 117 - i * 11;
+                top_bits_entropy |= (current_perm[i] as u128) << shift;
+            }
+            for w_top7 in 0..128u128 {
+                let entropy_128 = top_bits_entropy | w_top7;
+                let bytes = entropy_128.to_be_bytes();
+                let _sha_res = simple_sha256(&bytes);
+                let hi = (entropy_128 >> 64) as u64;
+                let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                local_candidates.push((hi, lo));
+            }
+        } else {
+            let actual_checksum = (current_perm[11] & 0x0F) as u8;
+            for w0 in 0..2048u16 {
+                current_perm[p0] = w0;
+                let mut entropy_128: u128 = 0;
+                for i in 0..11 {
+                    let shift = 117 - i * 11;
+                    entropy_128 |= (current_perm[i] as u128) << shift;
+                }
+                entropy_128 |= (current_perm[11] >> 4) as u128;
+
+                let bytes = entropy_128.to_be_bytes();
+                let sha_res = simple_sha256(&bytes);
+                let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+
+                if expected_checksum == actual_checksum {
+                    let hi = (entropy_128 >> 64) as u64;
+                    let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                    local_candidates.push((hi, lo));
+                }
+            }
+        }
+        return;
+    }
+
+    if w_count == 2 {
+        let p0 = wildcard_indices[0];
+        let p1 = wildcard_indices[1];
+        let mut current_perm = *perm;
+
+        if p1 == 11 {
+            for w0 in 0..2048u16 {
+                current_perm[p0] = w0;
+                let mut top_bits_entropy: u128 = 0;
+                for i in 0..11 {
+                    let shift = 117 - i * 11;
+                    top_bits_entropy |= (current_perm[i] as u128) << shift;
+                }
+                for w_top7 in 0..128u128 {
+                    let entropy_128 = top_bits_entropy | w_top7;
+                    let bytes = entropy_128.to_be_bytes();
+                    let _sha_res = simple_sha256(&bytes);
+                    let hi = (entropy_128 >> 64) as u64;
+                    let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                    local_candidates.push((hi, lo));
+                }
+            }
+        } else {
+            let actual_checksum = (current_perm[11] & 0x0F) as u8;
+            for w0 in 0..2048u16 {
+                current_perm[p0] = w0;
+                for w1 in 0..2048u16 {
+                    current_perm[p1] = w1;
+                    let mut entropy_128: u128 = 0;
+                    for i in 0..11 {
+                        let shift = 117 - i * 11;
+                        entropy_128 |= (current_perm[i] as u128) << shift;
+                    }
+                    entropy_128 |= (current_perm[11] >> 4) as u128;
+
+                    let bytes = entropy_128.to_be_bytes();
+                    let sha_res = simple_sha256(&bytes);
+                    let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+
+                    if expected_checksum == actual_checksum {
+                        let hi = (entropy_128 >> 64) as u64;
+                        let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                        local_candidates.push((hi, lo));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    fn expand_recursive(
+        depth: usize,
+        perm: &mut [u16; 12],
+        wildcard_indices: &[usize],
+        local_candidates: &mut Vec<(u64, u64)>,
+    ) {
+        if depth == wildcard_indices.len() {
+            let mut entropy_128: u128 = 0;
+            for i in 0..11 {
+                let shift = 117 - i * 11;
+                entropy_128 |= (perm[i] as u128) << shift;
+            }
+            entropy_128 |= (perm[11] >> 4) as u128;
+
+            let bytes = entropy_128.to_be_bytes();
+            let sha_res = simple_sha256(&bytes);
+            let expected_checksum = (sha_res[0] >> 4) & 0x0F;
+            let actual_checksum = (perm[11] & 0x0F) as u8;
+
+            if expected_checksum == actual_checksum {
+                let hi = (entropy_128 >> 64) as u64;
+                let lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+                local_candidates.push((hi, lo));
+            }
+            return;
+        }
+
+        let slot = wildcard_indices[depth];
+        for w in 0..2048u16 {
+            perm[slot] = w;
+            expand_recursive(depth + 1, perm, wildcard_indices, local_candidates);
+        }
+    }
+
+    let mut current_perm = *perm;
+    expand_recursive(0, &mut current_perm, wildcard_indices, local_candidates);
+}
+
+fn generate_unordered_wildcard_candidates_parallel(known_indices: &[u16]) -> Vec<(u64, u64)> {
+    let total_len = 12;
+    let k = known_indices.len();
+    let w = total_len - k;
+
+    let p_unique = compute_unique_placements_and_perms(known_indices, total_len);
+    let total_raw: u128 = p_unique * (2048_u128.pow(w as u32));
+    let expected_valid: u128 = total_raw / 16;
+
+    println!("\n=== Running Mode: UNORDERED WILDCARD MODE ===");
+    println!("Loaded {} known word(s) and {} wildcard slot(s).", k, w);
+    println!("Unique placement permutations (P_unique): {}", format_u128_with_commas(p_unique));
+    println!("Total raw combinations (before checksum): {}", format_u128_with_commas(total_raw));
+    println!("Expected valid BIP39 combinations (after checksum): ~{}", format_u128_with_commas(expected_valid));
+    println!("Generating and filtering candidates across CPU cores in parallel...\n");
+
+    let mut template = vec![0xFFFFu16; w];
+    template.extend_from_slice(known_indices);
+    template.sort_unstable();
+
+    let mut tasks = Vec::new();
+    let mut template_copy = template.clone();
+
+    let mut seen_pairs = std::collections::HashSet::new();
+    loop {
+        let pair = (template_copy[0], template_copy[1]);
+        if seen_pairs.insert(pair) {
+            let mut sub = Vec::with_capacity(10);
+            sub.extend_from_slice(&template_copy[2..]);
+            sub.sort_unstable();
+            tasks.push((pair.0, pair.1, sub));
+        }
+        if !next_permutation(&mut template_copy) {
+            break;
+        }
+    }
+
+    let pb = ProgressBar::new(p_unique as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[CPU Prep] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    let progress_counter = AtomicU64::new(0);
+
+    let candidate_chunks: Vec<Vec<(u64, u64)>> = tasks
+        .into_par_iter()
+        .map(|(val0, val1, mut sub)| {
+            let mut local_candidates = Vec::new();
+            let mut perm_count = 0u64;
+
+            loop {
+                let mut current_perm = [0u16; 12];
+                current_perm[0] = val0;
+                current_perm[1] = val1;
+                current_perm[2..].copy_from_slice(&sub);
+
+                let mut wildcard_indices = Vec::with_capacity(w);
+                for (idx, &v) in current_perm.iter().enumerate() {
+                    if v == 0xFFFF {
+                        wildcard_indices.push(idx);
+                    }
+                }
+
+                expand_wildcards_and_collect(&current_perm, &wildcard_indices, &mut local_candidates);
+
+                perm_count += 1;
+                if perm_count % 10_000 == 0 {
+                    progress_counter.fetch_add(10_000, Ordering::Relaxed);
+                    pb.set_position(progress_counter.load(Ordering::Relaxed));
+                }
+
+                if !next_permutation(&mut sub) {
+                    break;
+                }
+            }
+
+            local_candidates
+        })
+        .collect();
+
+    pb.finish_with_message("Unordered wildcard pre-filtering complete.");
+
+    let results: Vec<(u64, u64)> = candidate_chunks.into_iter().flatten().collect();
+    println!("Found {} valid BIP39 checksum candidate(s). Pre-loading into GPU memory...", format_with_commas(results.len() as u64));
+    results
+}
+
 fn next_permutation<T: Ord>(arr: &mut [T]) -> bool {
     if arr.len() <= 1 {
         return false;
@@ -1152,4 +1486,48 @@ fn mnemonic_gpu_range(
 
     pb.finish_with_message("GPU Range Search complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_unique_placements_and_perms() {
+        let unique_12 = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        assert_eq!(compute_unique_placements_and_perms(&unique_12, 12), 479_001_600);
+
+        let unique_10 = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(compute_unique_placements_and_perms(&unique_10, 12), 239_500_800);
+
+        let dup_10 = vec![0, 0, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(compute_unique_placements_and_perms(&dup_10, 12), 119_750_400);
+    }
+
+    #[test]
+    fn test_unordered_wildcard_candidate_generation() {
+        let test_words = [
+            "absurd", "avoid", "scissors", "anxiety", "gather",
+            "lottery", "category", "door", "army", "half", "long", "camera"
+        ];
+        let indices: Vec<u16> = test_words.iter().map(|w| bip39::get_word_index(w).unwrap() as u16).collect();
+
+        let mut entropy_128: u128 = 0;
+        for i in 0..11 {
+            let shift = 117 - i * 11;
+            entropy_128 |= (indices[i] as u128) << shift;
+        }
+        entropy_128 |= (indices[11] >> 4) as u128;
+        let expected_hi = (entropy_128 >> 64) as u64;
+        let expected_lo = (entropy_128 & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+
+        // Test with 12 known words in shuffled order
+        let subset_known = vec![
+            indices[11], indices[0], indices[1], indices[2], indices[3], indices[4],
+            indices[5], indices[6], indices[7], indices[8], indices[9], indices[10]
+        ];
+
+        let candidates = generate_unordered_wildcard_candidates_parallel(&subset_known);
+        assert!(candidates.contains(&(expected_hi, expected_lo)));
+    }
 }
