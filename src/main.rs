@@ -1232,7 +1232,7 @@ fn mnemonic_gpu_perm(
     let context_properties = ContextProperties::new().platform(platform_id);
     let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
     let program = core::create_program_with_source(&context, &[src])?;
-    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("-w")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
 
     let target_prefixes_buf = unsafe {
@@ -1390,7 +1390,7 @@ fn mnemonic_gpu_range(
     let context_properties = ContextProperties::new().platform(platform_id);
     let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
     let program = core::create_program_with_source(&context, &[src])?;
-    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("-w")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
 
     let target_prefixes_buf = unsafe {
@@ -1530,10 +1530,11 @@ fn mnemonic_gpu_unordered_wildcard(
     total_space: u128,
     batch_size: u64,
 ) -> ocl::core::Result<()> {
+    println!("Compiling OpenCL GPU kernel...");
     let context_properties = ContextProperties::new().platform(platform_id);
     let context = core::create_context(Some(&context_properties), &[device_id], None, None)?;
     let program = core::create_program_with_source(&context, &[src])?;
-    core::build_program(&program, Some(&[device_id]), &CString::new("")?, None, None)?;
+    core::build_program(&program, Some(&[device_id]), &CString::new("-w")?, None, None)?;
     let queue = core::create_command_queue(&context, &device_id, None)?;
 
     let unique_elements_buf = unsafe {
@@ -1579,6 +1580,8 @@ fn mnemonic_gpu_unordered_wildcard(
             .unwrap()
             .progress_chars("#>-"),
     );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_position(0);
 
     let mut current_offset: u128 = 0;
     let max_offset = total_space;
