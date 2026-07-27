@@ -1611,6 +1611,9 @@ fn mnemonic_gpu_unordered_wildcard(
         )?
     };
 
+    let filter_kernel = core::create_kernel(&program, "filter_unordered_wildcard_checksum")?;
+    let perm_kernel = core::create_kernel(&program, "int_to_address_perm")?;
+
     let mut current_offset: u128 = 0;
     let max_offset = total_space;
 
@@ -1633,7 +1636,6 @@ fn mnemonic_gpu_unordered_wildcard(
             )?;
         }
 
-        let filter_kernel = core::create_kernel(&program, "filter_unordered_wildcard_checksum")?;
         core::set_kernel_arg(&filter_kernel, 0, ArgVal::scalar(&combination_offset))?;
         core::set_kernel_arg(&filter_kernel, 1, ArgVal::mem(&unique_elements_buf))?;
         core::set_kernel_arg(&filter_kernel, 2, ArgVal::mem(&original_counts_buf))?;
@@ -1693,7 +1695,6 @@ fn mnemonic_gpu_unordered_wildcard(
                 )?
             };
 
-            let perm_kernel = core::create_kernel(&program, "int_to_address_perm")?;
             core::set_kernel_arg(&perm_kernel, 0, ArgVal::mem(&valid_hi_buf))?;
             core::set_kernel_arg(&perm_kernel, 1, ArgVal::mem(&valid_lo_buf))?;
             core::set_kernel_arg(&perm_kernel, 2, ArgVal::mem(&target_prefixes_buf))?;
