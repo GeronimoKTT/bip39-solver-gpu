@@ -1257,7 +1257,7 @@ fn mnemonic_gpu_perm(
     let pb = ProgressBar::new(total_candidates as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[GPU Process] [{elapsed_precise}] [{bar:40.green/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .template("[GPU Process] [{elapsed_precise}] [{bar:40.green/blue}] {pos}/{len} ({human_throughput}, ETA {eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -1414,7 +1414,7 @@ fn mnemonic_gpu_range(
     let pb = ProgressBar::new(total_space);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[GPU Range Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .template("[GPU Range Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({human_throughput}, ETA {eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -1576,7 +1576,7 @@ fn mnemonic_gpu_unordered_wildcard(
     let pb = ProgressBar::new(if total_space > u64::MAX as u128 { u64::MAX } else { total_space as u64 });
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[GPU Unordered Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA {eta})")
+            .template("[GPU Unordered Search] [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({human_throughput}, ETA {eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
