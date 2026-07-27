@@ -396,12 +396,13 @@ constant ulong FACTORIALS_TABLE[13] = {
 };
 
 inline ulong count_multiset_perms_gpu(const uchar counts[], uchar num_unique, uchar remaining_len) {
-    ulong num = FACTORIALS_TABLE[remaining_len];
     ulong den = 1UL;
-    for (uchar i = 0; i < num_unique; i++) {
-        den *= FACTORIALS_TABLE[counts[i]];
+    for (uchar i = 0; i < 12; i++) {
+        if (i < num_unique) {
+            den *= FACTORIALS_TABLE[counts[i]];
+        }
     }
-    return num / den;
+    return FACTORIALS_TABLE[remaining_len] / den;
 }
 
 inline void unrank_multiset_perm_gpu(
@@ -412,14 +413,14 @@ inline void unrank_multiset_perm_gpu(
     ushort out_indices[12]
 ) {
     uchar counts[12];
-    for (uchar i = 0; i < num_unique; i++) {
-        counts[i] = local_counts[i];
+    for (uchar i = 0; i < 12; i++) {
+        counts[i] = (i < num_unique) ? local_counts[i] : 0;
     }
 
     for (uchar slot = 0; slot < 12; slot++) {
         uchar remaining_len = 11 - slot;
-        for (uchar u = 0; u < num_unique; u++) {
-            if (counts[u] == 0) continue;
+        for (uchar u = 0; u < 12; u++) {
+            if (u >= num_unique || counts[u] == 0) continue;
 
             counts[u]--;
             ulong S = count_multiset_perms_gpu(counts, num_unique, remaining_len);
